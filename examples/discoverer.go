@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/paypal/gatt"
-	"github.com/paypal/gatt/examples/option"
+	"github.com/seangong/gatt"
+	"github.com/seangong/gatt/examples/option"
 )
 
 func onStateChanged(d gatt.Device, s gatt.State) {

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/paypal/gatt/xpc"
+	"github.com/seangong/gatt/xpc"
 )
 
 const (

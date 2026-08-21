@@ -4,7 +4,7 @@ import (
 	"errors"
 	"log"
 
-	"github.com/paypal/gatt/xpc"
+	"github.com/seangong/gatt/xpc"
 )
 
 type peripheral struct {
@@ -196,7 +196,7 @@ func (p *peripheral) SetNotifyValue(c *Characteristic, f func(*Characteristic, [
 
 func (p *peripheral) SetIndicateValue(c *Characteristic,
 	f func(*Characteristic, []byte, error)) error {
-	// TODO: Implement set indications logic for darwin (https://github.com/paypal/gatt/issues/32)
+	// TODO: Implement set indications logic for darwin (https://github.com/seangong/gatt/issues/32)
 	return nil
 }
 
