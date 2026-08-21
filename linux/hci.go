@@ -379,8 +379,14 @@ func (h *HCI) handleL2CAP(b []byte) error {
 		log.Printf("l2conn: got data for disconnected handle: 0x%04x", a.attr)
 		return nil
 	}
+	// Continuation fragments do not contain an L2CAP header. Forward them to
+	// conn.Read, which reassembles them with the first fragment.
+	if a.flags&0x03 == 0x01 {
+		c.aclc <- a
+		return nil
+	}
 	if len(a.b) < 4 {
-		log.Printf("l2conn: l2cap packet is too short/corrupt, length is %d", len(a.b))
+		log.Printf("l2conn: l2cap packet is too short/corrupt, length is %d, flags is 0x%02x", len(a.b), a.flags)
 		return nil
 	}
 	cid := uint16(a.b[2]) | (uint16(a.b[3]) << 8)
