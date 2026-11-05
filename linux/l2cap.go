@@ -8,6 +8,13 @@ import (
 	"github.com/seangong/gatt/linux/cmd"
 )
 
+const (
+	aclPBMask         = 0x03
+	aclPBContinuation = 0x01
+	aclPBComplete     = 0x03 // Legacy complete PDU flag.
+	l2capHeaderLen    = 4
+)
+
 type aclData struct {
 	attr  uint16
 	flags uint8
@@ -31,16 +38,17 @@ func (a *aclData) unmarshal(b []byte) error {
 }
 
 type conn struct {
-	hci  *HCI
-	attr uint16
-	aclc chan *aclData
+	hci   *HCI
+	attr  uint16
+	aclc  chan []byte
+	rxPDU []byte // Partial L2CAP PDU, protected by hci.connsmu.
 }
 
 func newConn(hci *HCI, hh uint16) *conn {
 	return &conn{
 		hci:  hci,
 		attr: hh,
-		aclc: make(chan *aclData),
+		aclc: make(chan []byte),
 	}
 }
 
@@ -98,26 +106,14 @@ func (c *conn) write(cid int, b []byte) (int, error) {
 }
 
 func (c *conn) Read(b []byte) (int, error) {
-	a, ok := <-c.aclc
+	payload, ok := <-c.aclc
 	if !ok {
 		return 0, io.EOF
 	}
-	tlen := int(uint16(a.b[0]) | uint16(a.b[1])<<8)
-	if tlen > len(b) {
+	if len(payload) > len(b) {
 		return 0, io.ErrShortBuffer
 	}
-	d := a.b[4:] // skip l2cap header
-	copy(b, d)
-	n := len(d)
-
-	// Keep receiving and reassemble continued l2cap segments
-	for n != tlen {
-		if a, ok = <-c.aclc; !ok || (a.flags&0x1) == 0 {
-			return n, io.ErrUnexpectedEOF
-		}
-		copy(b[n:], a.b)
-		n += len(a.b)
-	}
+	n := copy(b, payload)
 	// log.Printf("R: [ % X ]", b[:n])
 	return n, nil
 }
@@ -167,8 +163,8 @@ func (c *conn) Close() error {
 // 0x14 LE Credit Based Connection request		0x0005
 // 0x15 LE Credit Based Connection response		0x0005
 // 0x16 LE Flow Control Credit					0x0005
-func (c *conn) handleSignal(a *aclData) error {
-	log.Printf("ignore l2cap signal:[ % X ]", a.b)
+func (c *conn) handleSignal(b []byte) error {
+	log.Printf("ignore l2cap signal:[ % X ]", b)
 	// FIXME: handle LE signaling channel (CID: 5)
 	return nil
 }
