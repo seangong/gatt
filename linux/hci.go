@@ -1,15 +1,20 @@
 package linux
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/seangong/gatt/v2/linux/cmd"
 	"github.com/seangong/gatt/v2/linux/evt"
 )
+
+const hciCloseTimeout = 5 * time.Second
 
 type HCI struct {
 	AcceptMasterHandler  func(pd *PlatData)
@@ -94,14 +99,32 @@ func (h *HCI) Close() error {
 		h.closed = true
 		connections := make([]*conn, 0, len(h.conns))
 		for _, c := range h.conns {
+			c.stop()
 			connections = append(connections, c)
 		}
 		h.connsmu.Unlock()
+		// Disconnect shares the command queue with other HCI operations. Bound
+		// the total wait so an unresponsive command cannot prevent shutdown.
+		timeoutDone := make(chan struct{})
+		timer := time.AfterFunc(hciCloseTimeout, func() {
+			h.c.Close()
+			close(timeoutDone)
+		})
 		for _, c := range connections {
 			c.Close()
 		}
+		timedOut := !timer.Stop()
+		if timedOut {
+			<-timeoutDone
+		}
 		h.c.Close()
 		h.closeErr = h.d.Close()
+		if timedOut {
+			h.closeErr = errors.Join(
+				fmt.Errorf("hci: timed out waiting for connections to close: %w", context.DeadlineExceeded),
+				h.closeErr,
+			)
+		}
 	})
 	return h.closeErr
 }

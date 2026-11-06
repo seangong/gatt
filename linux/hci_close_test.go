@@ -2,11 +2,14 @@ package linux
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/seangong/gatt/v2/linux/cmd"
 )
@@ -16,6 +19,7 @@ type pendingDisconnectTestDevice struct {
 	closed     chan struct{}
 	closeOnce  sync.Once
 	closeCalls atomic.Int32
+	closeErr   error
 }
 
 func (*pendingDisconnectTestDevice) Read([]byte) (int, error) { return 0, io.EOF }
@@ -28,7 +32,116 @@ func (d *pendingDisconnectTestDevice) Write(b []byte) (int, error) {
 func (d *pendingDisconnectTestDevice) Close() error {
 	d.closeCalls.Add(1)
 	d.closeOnce.Do(func() { close(d.closed) })
-	return nil
+	return d.closeErr
+}
+
+func TestHCICloseCancelsUnresponsiveCommands(t *testing.T) {
+	deviceErr := errors.New("device close failed")
+	for _, tt := range []struct {
+		name        string
+		pending     string
+		connections int
+		closeErr    error
+	}{
+		{"unrelated command", "command", 2, nil},
+		{"new disconnect", "", 2, nil},
+		{"existing disconnect", "disconnect", 2, deviceErr},
+		{"no connections", "command", 0, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// These cases block on sendMu or sync.Once, so synctest cannot
+			// advance a fake clock while waiting for the shutdown deadline.
+			t.Parallel()
+			d := &pendingDisconnectTestDevice{
+				commands: make(chan []byte, 4),
+				closed:   make(chan struct{}),
+				closeErr: tt.closeErr,
+			}
+			h := &HCI{
+				d:       d,
+				c:       cmd.NewCmd(d),
+				connsmu: &sync.Mutex{},
+				conns:   make(map[uint16]*conn),
+			}
+			var callers sync.WaitGroup
+			defer func() {
+				h.c.Close()
+				callers.Wait()
+			}()
+			connections := make([]*conn, 0, tt.connections)
+			for i := 0; i < tt.connections; i++ {
+				c := newConn(h, uint16(i+1))
+				h.conns[c.attr] = c
+				connections = append(connections, c)
+			}
+			deadline := time.NewTimer(10 * time.Second)
+			defer deadline.Stop()
+			pendingResult := make(chan error, 1)
+			if tt.pending != "" {
+				callers.Go(func() {
+					if tt.pending == "command" {
+						_, err := h.c.Send(cmd.Reset{})
+						pendingResult <- err
+					} else {
+						pendingResult <- connections[0].Close()
+					}
+				})
+				select {
+				case <-d.commands: // Leave this command waiting for a response.
+				case <-deadline.C:
+					t.Fatal("pending command was not written")
+				}
+			}
+			closeResults := make(chan error, 2)
+			for i := 0; i < cap(closeResults); i++ {
+				callers.Go(func() { closeResults <- h.Close() })
+			}
+			for _, c := range connections {
+				select {
+				case <-c.done:
+				case <-time.After(time.Second):
+					t.Errorf("connection %d was not stopped before waiting for Disconnect", c.attr)
+				}
+			}
+			if tt.connections != 0 {
+				select {
+				case <-d.closed:
+					t.Fatal("device was closed before the disconnect deadline")
+				default:
+				}
+			}
+			for i := 0; i < cap(closeResults); i++ {
+				select {
+				case err := <-closeResults:
+					if tt.connections == 0 {
+						if err != nil {
+							t.Errorf("Close() without connections = %v, want nil", err)
+						}
+					} else if !errors.Is(err, context.DeadlineExceeded) {
+						t.Errorf("Close() = %v, want deadline exceeded", err)
+					}
+					if tt.closeErr != nil && !errors.Is(err, tt.closeErr) {
+						t.Errorf("Close() = %v, want original device error %v", err, tt.closeErr)
+					}
+				case <-deadline.C:
+					t.Fatal("HCI.Close remained blocked on an unresponsive command")
+				}
+			}
+			if tt.pending != "" {
+				select {
+				case err := <-pendingResult:
+					if !errors.Is(err, io.ErrClosedPipe) {
+						t.Errorf("pending command = %v, want closed pipe", err)
+					}
+				case <-deadline.C:
+					t.Fatal("pending command did not exit during HCI.Close")
+				}
+			}
+			if got := d.closeCalls.Load(); got != 1 {
+				t.Errorf("device Close calls = %d, want 1", got)
+			}
+		})
+	}
 }
 
 func TestHCICloseWaitsForOverflowDisconnect(t *testing.T) {
