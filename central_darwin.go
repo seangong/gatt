@@ -3,7 +3,7 @@ package gatt
 import (
 	"sync"
 
-	"github.com/seangong/gatt/xpc"
+	"github.com/seangong/gatt/v2/xpc"
 )
 
 type central struct {
@@ -27,6 +27,8 @@ func newCentral(d *device, u UUID) *central {
 func (c *central) ID() string   { return c.uuid.String() }
 func (c *central) Close() error { return nil }
 func (c *central) MTU() int     { return c.mtu }
+
+func (n *notifier) Cap() int { return n.maxlen }
 
 func (c *central) sendNotification(a *attr, b []byte) (int, error) {
 	data := make([]byte, len(b))

@@ -5,14 +5,15 @@ import (
 	"io"
 	"log"
 
-	"github.com/seangong/gatt/linux/cmd"
+	"github.com/seangong/gatt/v2/linux/cmd"
 )
 
 const (
-	aclPBMask         = 0x03
-	aclPBContinuation = 0x01
-	aclPBComplete     = 0x03 // Legacy complete PDU flag.
-	l2capHeaderLen    = 4
+	aclPBMask             = 0x03
+	aclPBContinuation     = 0x01
+	aclPBComplete         = 0x03 // Legacy complete PDU flag.
+	l2capHeaderLen        = 4
+	l2capReceiveQueueSize = 16
 )
 
 type aclData struct {
@@ -38,17 +39,34 @@ func (a *aclData) unmarshal(b []byte) error {
 }
 
 type conn struct {
-	hci   *HCI
-	attr  uint16
-	aclc  chan []byte
-	rxPDU []byte // Partial L2CAP PDU, protected by hci.connsmu.
+	hci            *HCI
+	attr           uint16
+	aclc           chan []byte
+	done           chan struct{}
+	disconnecting  bool // Protected by hci.connsmu.
+	disconnectDone chan struct{}
+	disconnectErr  error  // Published by closing disconnectDone.
+	rxPDU          []byte // Partial L2CAP PDU, protected by hci.connsmu.
 }
 
 func newConn(hci *HCI, hh uint16) *conn {
 	return &conn{
-		hci:  hci,
-		attr: hh,
-		aclc: make(chan []byte),
+		hci:            hci,
+		attr:           hh,
+		aclc:           make(chan []byte, l2capReceiveQueueSize),
+		done:           make(chan struct{}),
+		disconnectDone: make(chan struct{}),
+	}
+}
+
+// stop must be called with hci.connsmu held. The receive queue stays open;
+// done wakes blocked readers and writers without racing with packet delivery.
+func (c *conn) stop() {
+	c.rxPDU = nil
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
 	}
 }
 
@@ -93,8 +111,23 @@ func (c *conn) write(cid int, b []byte) (int, error) {
 		w[3] = uint8(dlen)
 		w[4] = uint8(dlen >> 8)
 
-		// make sure we don't send more buffers than the controller can handdle
-		c.hci.bufCnt <- struct{}{}
+		// Keep connection shutdown independent of controller transmit credits.
+		select {
+		case <-c.done:
+			return max(0, tlen-n), io.ErrClosedPipe
+		default:
+		}
+		select {
+		case <-c.done:
+			return max(0, tlen-n), io.ErrClosedPipe
+		case c.hci.bufCnt <- struct{}{}:
+		}
+		select {
+		case <-c.done:
+			<-c.hci.bufCnt
+			return max(0, tlen-n), io.ErrClosedPipe
+		default:
+		}
 
 		c.hci.d.Write(w[:5+dlen])
 		w = w[dlen:] // advance the pointer to the next segment, if any.
@@ -106,9 +139,25 @@ func (c *conn) write(cid int, b []byte) (int, error) {
 }
 
 func (c *conn) Read(b []byte) (int, error) {
-	payload, ok := <-c.aclc
-	if !ok {
+	select {
+	case <-c.done:
 		return 0, io.EOF
+	default:
+	}
+	var payload []byte
+	select {
+	case <-c.done:
+		return 0, io.EOF
+	case p, ok := <-c.aclc:
+		if !ok {
+			return 0, io.EOF
+		}
+		payload = p
+	}
+	select {
+	case <-c.done:
+		return 0, io.EOF
+	default:
 	}
 	if len(payload) > len(b) {
 		return 0, io.ErrShortBuffer
@@ -127,16 +176,25 @@ func (c *conn) Close() error {
 	h := c.hci
 	hh := c.attr
 	h.connsmu.Lock()
-	defer h.connsmu.Unlock()
-	_, found := h.conns[hh]
-	if !found {
-		// log.Printf("l2conn: 0x%04x already disconnected", hh)
+	current, found := h.conns[hh]
+	if !found || current != c {
+		h.connsmu.Unlock()
 		return nil
 	}
-	if err, _ := h.c.Send(cmd.Disconnect{ConnectionHandle: hh, Reason: 0x13}); err != nil {
-		return fmt.Errorf("l2conn: failed to disconnect, %s", err)
+	if c.disconnecting {
+		h.connsmu.Unlock()
+		<-c.disconnectDone
+		return c.disconnectErr
 	}
-	return nil
+	c.disconnecting = true
+	c.stop()
+	h.connsmu.Unlock()
+
+	if _, err := h.c.Send(cmd.Disconnect{ConnectionHandle: hh, Reason: 0x13}); err != nil {
+		c.disconnectErr = fmt.Errorf("l2conn: failed to disconnect: %w", err)
+	}
+	close(c.disconnectDone)
+	return c.disconnectErr
 }
 
 // Signal Packets

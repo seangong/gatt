@@ -1,4 +1,5 @@
-// +build
+//go:build ignore
+// +build ignore
 
 package main
 
@@ -10,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/seangong/gatt"
-	"github.com/seangong/gatt/examples/option"
+	"github.com/seangong/gatt/v2"
+	"github.com/seangong/gatt/v2/examples/option"
 )
 
 var done = make(chan struct{})

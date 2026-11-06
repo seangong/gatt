@@ -1,4 +1,5 @@
-// +build
+//go:build ignore
+// +build ignore
 
 package main
 
@@ -6,8 +7,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/seangong/gatt"
-	"github.com/seangong/gatt/examples/option"
+	"github.com/seangong/gatt/v2"
+	"github.com/seangong/gatt/v2/examples/option"
 )
 
 func onStateChanged(d gatt.Device, s gatt.State) {

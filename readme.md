@@ -43,7 +43,20 @@ either be run as root, or be granted appropriate capabilities:
     <executable>
 
 ## Usage
-Please see [godoc.org](http://godoc.org/github.com/seangong/gatt) for documentation.
+
+Install version 2.0.0:
+
+```sh
+go get github.com/seangong/gatt/v2@v2.0.0
+```
+
+Use the v2 module path in imports:
+
+```go
+import "github.com/seangong/gatt/v2"
+```
+
+Please see [pkg.go.dev](https://pkg.go.dev/github.com/seangong/gatt/v2) for documentation.
 
 ## Examples
 

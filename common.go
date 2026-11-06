@@ -1,7 +1,7 @@
 package gatt
 
 // Supported statuses for GATT characteristic read/write operations.
-// These correspond to att constants in the BLE spec
+// These are API statuses, not ATT error codes.
 const (
 	StatusSuccess         = 0
 	StatusInvalidOffset   = 1

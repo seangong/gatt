@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/seangong/gatt"
+	"github.com/seangong/gatt/v2"
 )
 
 func NewCountService() *gatt.Service {

@@ -1,4 +1,5 @@
-// +build
+//go:build ignore
+// +build ignore
 
 package main
 
@@ -6,9 +7,9 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/seangong/gatt"
-	"github.com/seangong/gatt/examples/option"
-	"github.com/seangong/gatt/examples/service"
+	"github.com/seangong/gatt/v2"
+	"github.com/seangong/gatt/v2/examples/option"
+	"github.com/seangong/gatt/v2/examples/service"
 )
 
 func main() {

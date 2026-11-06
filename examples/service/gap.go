@@ -1,6 +1,6 @@
 package service
 
-import "github.com/seangong/gatt"
+import "github.com/seangong/gatt/v2"
 
 var (
 	attrGAPUUID = gatt.UUID16(0x1800)

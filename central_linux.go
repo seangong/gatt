@@ -18,6 +18,7 @@ const (
 type central struct {
 	attrs       *attrRange
 	mtu         uint16
+	mtuMu       sync.RWMutex
 	addr        net.HardwareAddr
 	security    security
 	l2conn      io.ReadWriteCloser
@@ -51,7 +52,13 @@ func (c *central) Close() error {
 }
 
 func (c *central) MTU() int {
+	c.mtuMu.RLock()
+	defer c.mtuMu.RUnlock()
 	return int(c.mtu)
+}
+
+func (n *notifier) Cap() int {
+	return min(n.central.MTU()-3, attMaxValueLen)
 }
 
 func (c *central) loop() {
@@ -107,8 +114,11 @@ func (c *central) handleReq(b []byte) []byte {
 		resp = c.handleReadBlob(req)
 	case attOpReadByGroupReq:
 		resp = c.handleReadByGroup(req)
-	case attOpWriteReq, attOpWriteCmd:
+	case attOpWriteReq:
 		resp = c.handleWrite(reqType, req)
+	case attOpWriteCmd:
+		c.handleWrite(reqType, req)
+		return nil
 	case attOpReadMultiReq, attOpPrepWriteReq, attOpExecWriteReq, attOpSignedWriteCmd:
 		fallthrough
 	default:
@@ -135,14 +145,17 @@ func validATTParamLength(op byte, n int) bool {
 }
 
 func (c *central) handleMTU(b []byte) []byte {
-	c.mtu = binary.LittleEndian.Uint16(b[:2])
-	if c.mtu < 23 {
-		c.mtu = 23
+	mtu := binary.LittleEndian.Uint16(b[:2])
+	if mtu < 23 {
+		mtu = 23
 	}
-	if c.mtu >= 256 {
-		c.mtu = 256
+	if mtu > attMaxMTU {
+		mtu = attMaxMTU
 	}
-	return []byte{attOpMtuRsp, uint8(c.mtu), uint8(c.mtu >> 8)}
+	c.mtuMu.Lock()
+	c.mtu = mtu
+	c.mtuMu.Unlock()
+	return []byte{attOpMtuRsp, uint8(mtu), uint8(mtu >> 8)}
 }
 
 // REQ: FindInfoReq(0x04), StartHandle, EndHandle
@@ -226,6 +239,8 @@ func (c *central) handleReadByType(b []byte) []byte {
 	start, end := readHandleRange(b[:4])
 	t := UUID{b[4:]}
 
+	// Each handle-value pair has a one-byte length field and a two-byte handle.
+	valueCap := min(int(c.mtu)-4, 253)
 	w := newL2capWriter(c.mtu)
 	w.WriteByteFit(attOpReadByTypeRsp)
 	uuidLen := -1
@@ -238,10 +253,10 @@ func (c *central) handleReadByType(b []byte) []byte {
 		}
 		v := a.value
 		if v == nil {
-			rsp := newResponseWriter(int(c.mtu - 1))
+			rsp := newResponseWriter(valueCap)
 			req := &ReadRequest{
 				Request: Request{Central: c},
-				Cap:     int(c.mtu - 1),
+				Cap:     valueCap,
 				Offset:  0,
 			}
 			if c, ok := a.pvt.(*Characteristic); ok {
@@ -253,14 +268,14 @@ func (c *central) handleReadByType(b []byte) []byte {
 		}
 		if uuidLen == -1 {
 			uuidLen = len(v)
-			w.WriteByteFit(byte(uuidLen) + 2)
+			w.WriteByteFit(byte(min(uuidLen, valueCap) + 2))
 		}
 		if len(v) != uuidLen {
 			break
 		}
 		w.Chunk()
 		w.WriteUint16Fit(a.h)
-		w.WriteFit(v)
+		w.WriteFit(v[:min(len(v), valueCap)])
 		if ok := w.Commit(); !ok {
 			break
 		}
@@ -285,14 +300,15 @@ func (c *central) handleRead(b []byte) []byte {
 	if a.secure&CharRead != 0 && c.security > securityLow {
 		return attErrorRsp(attOpReadReq, h, attEcodeAuthentication)
 	}
+	valueCap := min(int(c.mtu)-1, attMaxValueLen)
 	v := a.value
 	if v == nil {
 		req := &ReadRequest{
 			Request: Request{Central: c},
-			Cap:     int(c.mtu - 1),
+			Cap:     valueCap,
 			Offset:  0,
 		}
-		rsp := newResponseWriter(int(c.mtu - 1))
+		rsp := newResponseWriter(valueCap)
 		if c, ok := a.pvt.(*Characteristic); ok {
 			c.rhandler.ServeRead(rsp, req)
 		} else if d, ok := a.pvt.(*Descriptor); ok {
@@ -301,7 +317,7 @@ func (c *central) handleRead(b []byte) []byte {
 		v = rsp.bytes()
 	}
 
-	w := newL2capWriter(c.mtu)
+	w := newL2capWriter(uint16(valueCap + 1))
 	w.WriteByteFit(attOpReadRsp)
 	w.Chunk()
 	w.WriteFit(v)
@@ -323,14 +339,15 @@ func (c *central) handleReadBlob(b []byte) []byte {
 	if a.secure&CharRead != 0 && c.security > securityLow {
 		return attErrorRsp(attOpReadBlobReq, h, attEcodeAuthentication)
 	}
+	valueCap := min(int(c.mtu)-1, attMaxValueLen)
 	v := a.value
 	if v == nil {
 		req := &ReadRequest{
 			Request: Request{Central: c},
-			Cap:     int(c.mtu - 1),
+			Cap:     valueCap,
 			Offset:  int(offset),
 		}
-		rsp := newResponseWriter(int(c.mtu - 1))
+		rsp := newResponseWriter(valueCap)
 		if c, ok := a.pvt.(*Characteristic); ok {
 			c.rhandler.ServeRead(rsp, req)
 		} else if d, ok := a.pvt.(*Descriptor); ok {
@@ -339,7 +356,7 @@ func (c *central) handleReadBlob(b []byte) []byte {
 		v = rsp.bytes()
 		offset = 0 // the server has already adjusted for the offset
 	}
-	w := newL2capWriter(c.mtu)
+	w := newL2capWriter(uint16(valueCap + 1))
 	w.WriteByteFit(attOpReadBlobRsp)
 	w.Chunk()
 	w.WriteFit(v)
@@ -410,21 +427,33 @@ func (c *central) handleWrite(reqType byte, b []byte) []byte {
 		return attErrorRsp(reqType, h, attEcodeAuthentication)
 	}
 
+	if len(value) > attMaxValueLen {
+		return attErrorRsp(reqType, h, attEcodeInvalAttrValueLen)
+	}
+
 	// Props of Service and Characteristic declration are read only.
 	// So we only need deal with writable descriptors here.
 	// (Characteristic's value is implemented with descriptor)
 	if !a.typ.Equal(attrClientCharacteristicConfigUUID) {
 		// Regular write, not CCC
 		r := Request{Central: c}
-		if c, ok := a.pvt.(*Characteristic); ok {
-			c.whandler.ServeWrite(r, value)
-		} else if d, ok := a.pvt.(*Characteristic); ok {
-			d.whandler.ServeWrite(r, value)
+		status := byte(StatusUnexpectedError)
+		switch target := a.pvt.(type) {
+		case *Characteristic:
+			status = target.whandler.ServeWrite(r, value)
+		case *Descriptor:
+			status = target.whandler.ServeWrite(r, value)
 		}
 		if noRsp {
 			return nil
-		} else {
+		}
+		switch status {
+		case StatusSuccess:
 			return []byte{attOpWriteRsp}
+		case StatusInvalidOffset:
+			return attErrorRsp(reqType, h, attEcodeInvalidOffset)
+		default:
+			return attErrorRsp(reqType, h, attEcodeUnlikely)
 		}
 	}
 
@@ -446,11 +475,25 @@ func (c *central) handleWrite(reqType byte, b []byte) []byte {
 }
 
 func (c *central) sendNotification(a *attr, data []byte) (int, error) {
-	w := newL2capWriter(c.mtu)
+	mtu := uint16(c.MTU())
+	if len(data) > min(int(mtu)-3, attMaxValueLen) {
+		return 0, io.ErrShortWrite
+	}
+	w := newL2capWriter(mtu)
 	w.WriteByteFit(attOpHandleNotify)
 	w.WriteUint16Fit(a.pvt.(*Descriptor).char.vh)
 	w.WriteFit(data)
-	return c.l2conn.Write(w.Bytes())
+	packet := w.Bytes()
+	n, err := c.l2conn.Write(packet)
+	if err == nil && n != len(packet) {
+		err = io.ErrShortWrite
+	}
+	// Report value bytes to the caller, excluding the ATT opcode and handle.
+	n -= 3
+	if n < 0 {
+		n = 0
+	}
+	return n, err
 }
 
 func readHandleRange(b []byte) (start, end uint16) {

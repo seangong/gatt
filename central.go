@@ -102,7 +102,9 @@ func (f NotifyHandlerFunc) ServeNotify(r Request, n Notifier) {
 // notifications about value changes to a connected device.
 // Notifiers are provided by NotifyHandlers.
 type Notifier interface {
-	// Write sends data to the central.
+	// Write sends one notification and returns the number of value bytes sent.
+	// On Linux, data exceeding Cap returns io.ErrShortWrite without sending
+	// a notification.
 	Write(data []byte) (int, error)
 
 	// Done reports whether the central has requested not to
@@ -133,10 +135,6 @@ func (n *notifier) Write(b []byte) (int, error) {
 		return 0, errors.New("central stopped notifications")
 	}
 	return n.central.sendNotification(n.a, b)
-}
-
-func (n *notifier) Cap() int {
-	return n.maxlen
 }
 
 func (n *notifier) Done() bool {

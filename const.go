@@ -28,6 +28,12 @@ const (
 )
 
 const (
+	attMaxValueLen = 512
+	// Maximum supported MTU: attribute value plus Prepare Write opcode, handle, and offset.
+	attMaxMTU = attMaxValueLen + 5
+)
+
+const (
 	attOpError              = 0x01
 	attOpMtuReq             = 0x02
 	attOpMtuRsp             = 0x03

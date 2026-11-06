@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
 
-	"github.com/seangong/gatt/linux/evt"
-	"github.com/seangong/gatt/linux/util"
+	"github.com/seangong/gatt/v2/linux/evt"
+	"github.com/seangong/gatt/v2/linux/util"
 )
 
 type CmdParam interface {
@@ -23,6 +24,7 @@ func NewCmd(d io.Writer) *Cmd {
 		sent:    []*cmdPkt{},
 		compc:   make(chan evt.CommandCompleteEP),
 		statusc: make(chan evt.CommandStatusEP),
+		done:    make(chan struct{}),
 	}
 	go c.processCmdEvents()
 	return c
@@ -45,21 +47,34 @@ func (c cmdPkt) Marshal() []byte {
 }
 
 type Cmd struct {
-	dev     io.Writer
-	sent    []*cmdPkt
-	compc   chan evt.CommandCompleteEP
-	statusc chan evt.CommandStatusEP
+	sendMu    sync.Mutex // Serialize complete command transactions.
+	sentMu    sync.Mutex // Protect sent from the event worker and Send cleanup.
+	dev       io.Writer
+	sent      []*cmdPkt
+	compc     chan evt.CommandCompleteEP
+	statusc   chan evt.CommandStatusEP
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
-func (c Cmd) trace(fmt string, v ...interface{}) {}
+func (c *Cmd) trace(fmt string, v ...interface{}) {}
 
 func (c *Cmd) HandleComplete(b []byte) error {
 	var e evt.CommandCompleteEP
 	if err := e.Unmarshal(b); err != nil {
 		return err
 	}
-	c.compc <- e
-	return nil
+	select {
+	case <-c.done:
+		return io.ErrClosedPipe
+	default:
+	}
+	select {
+	case <-c.done:
+		return io.ErrClosedPipe
+	case c.compc <- e:
+		return nil
+	}
 }
 
 func (c *Cmd) HandleStatus(b []byte) error {
@@ -67,22 +82,61 @@ func (c *Cmd) HandleStatus(b []byte) error {
 	if err := e.Unmarshal(b); err != nil {
 		return err
 	}
-	c.statusc <- e
-	return nil
+	select {
+	case <-c.done:
+		return io.ErrClosedPipe
+	default:
+	}
+	select {
+	case <-c.done:
+		return io.ErrClosedPipe
+	case c.statusc <- e:
+		return nil
+	}
+}
+
+// Close stops command processing without closing the underlying device.
+func (c *Cmd) Close() {
+	c.closeOnce.Do(func() { close(c.done) })
 }
 
 func (c *Cmd) Send(cp CmdParam) ([]byte, error) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	select {
+	case <-c.done:
+		return nil, io.ErrClosedPipe
+	default:
+	}
+
 	op := cp.Opcode()
-	p := &cmdPkt{op: op, cp: cp, done: make(chan []byte)}
+	p := &cmdPkt{op: op, cp: cp, done: make(chan []byte, 1)}
 	raw := p.Marshal()
 
+	c.sentMu.Lock()
 	c.sent = append(c.sent, p)
+	c.sentMu.Unlock()
+	defer func() {
+		c.sentMu.Lock()
+		defer c.sentMu.Unlock()
+		for i, pending := range c.sent {
+			if pending == p {
+				c.sent = append(c.sent[:i], c.sent[i+1:]...)
+				break
+			}
+		}
+	}()
 	if n, err := c.dev.Write(raw); err != nil {
 		return nil, err
 	} else if n != len(raw) {
 		return nil, errors.New("Failed to send whole Cmd pkt to HCI socket")
 	}
-	return <-p.done, nil
+	select {
+	case <-c.done:
+		return nil, io.ErrClosedPipe
+	case response := <-p.done:
+		return response, nil
+	}
 }
 
 func (c *Cmd) SendAndCheckResp(cp CmdParam, exp []byte) error {
@@ -104,31 +158,39 @@ func (c *Cmd) SendAndCheckResp(cp CmdParam, exp []byte) error {
 func (c *Cmd) processCmdEvents() {
 	for {
 		select {
+		case <-c.done:
+			return
 		case status := <-c.statusc:
-			found := false
+			var pending *cmdPkt
+			c.sentMu.Lock()
 			for i, p := range c.sent {
 				if uint16(p.op) == status.CommandOpcode {
-					found = true
+					pending = p
 					c.sent = append(c.sent[:i], c.sent[i+1:]...)
-					close(p.done)
 					break
 				}
 			}
-			if !found {
+			c.sentMu.Unlock()
+			if pending == nil {
 				log.Printf("Can't find the cmdPkt for this CommandStatusEP: %v", status)
+			} else {
+				close(pending.done)
 			}
 		case comp := <-c.compc:
-			found := false
+			var pending *cmdPkt
+			c.sentMu.Lock()
 			for i, p := range c.sent {
 				if uint16(p.op) == comp.CommandOPCode {
-					found = true
+					pending = p
 					c.sent = append(c.sent[:i], c.sent[i+1:]...)
-					p.done <- comp.ReturnParameters
 					break
 				}
 			}
-			if !found {
+			c.sentMu.Unlock()
+			if pending == nil {
 				log.Printf("Can't find the cmdPkt for this CommandCompleteEP: %v", comp)
+			} else {
+				pending.done <- comp.ReturnParameters
 			}
 		}
 	}
@@ -140,9 +202,9 @@ const (
 	hostCtl     = 0x03
 	infoParam   = 0x04
 	statusParam = 0x05
-	testingCmd  = 0X3E
+	testingCmd  = 0x3E
 	leCtl       = 0x08
-	vendorCmd   = 0X3F
+	vendorCmd   = 0x3F
 )
 
 const (

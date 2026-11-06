@@ -7,8 +7,8 @@ import (
 	"log"
 	"sync"
 
-	"github.com/seangong/gatt/linux/cmd"
-	"github.com/seangong/gatt/linux/evt"
+	"github.com/seangong/gatt/v2/linux/cmd"
+	"github.com/seangong/gatt/v2/linux/evt"
 )
 
 type HCI struct {
@@ -29,6 +29,10 @@ type HCI struct {
 	maxConn int
 	connsmu *sync.Mutex
 	conns   map[uint16]*conn
+	closed  bool // Protected by connsmu.
+
+	closeOnce sync.Once
+	closeErr  error
 
 	adv   bool
 	advmu *sync.Mutex
@@ -85,10 +89,21 @@ func NewHCI(devID int, chk bool, maxConn int) (*HCI, error) {
 }
 
 func (h *HCI) Close() error {
-	for _, c := range h.conns {
-		c.Close()
-	}
-	return h.d.Close()
+	h.closeOnce.Do(func() {
+		h.connsmu.Lock()
+		h.closed = true
+		connections := make([]*conn, 0, len(h.conns))
+		for _, c := range h.conns {
+			connections = append(connections, c)
+		}
+		h.connsmu.Unlock()
+		for _, c := range connections {
+			c.Close()
+		}
+		h.c.Close()
+		h.closeErr = h.d.Close()
+	})
+	return h.closeErr
 }
 
 func (h *HCI) SetAdvertiseEnable(en bool) error {
@@ -99,9 +114,15 @@ func (h *HCI) SetAdvertiseEnable(en bool) error {
 }
 
 func (h *HCI) setAdvertiseEnable(en bool) error {
+	h.connsmu.Lock()
+	closed, connectionCount := h.closed, len(h.conns)
+	h.connsmu.Unlock()
+	if closed {
+		return io.ErrClosedPipe
+	}
 	h.advmu.Lock()
 	defer h.advmu.Unlock()
-	if en && h.adv && (len(h.conns) == h.maxConn) {
+	if en && h.adv && (connectionCount == h.maxConn) {
 		return nil
 	}
 	return h.c.SendAndCheckResp(
@@ -162,6 +183,16 @@ func btoi(b bool) uint8 {
 }
 
 func (h *HCI) mainLoop() {
+	defer func() {
+		h.c.Close()
+		h.connsmu.Lock()
+		defer h.connsmu.Unlock()
+		h.closed = true
+		for handle, c := range h.conns {
+			c.stop()
+			delete(h.conns, handle)
+		}
+	}()
 	b := make([]byte, 4096)
 	for {
 		n, err := h.d.Read(b)
@@ -303,6 +334,11 @@ func (h *HCI) handleConnection(b []byte) {
 	hh := ep.ConnectionHandle
 	c := newConn(h, hh)
 	h.connsmu.Lock()
+	if h.closed {
+		c.stop()
+		h.connsmu.Unlock()
+		return
+	}
 	h.conns[hh] = c
 	h.connsmu.Unlock()
 	h.setAdvertiseEnable(true)
@@ -336,16 +372,16 @@ func (h *HCI) handleDisconnectionComplete(b []byte) error {
 	}
 	hh := ep.ConnectionHandle
 	h.connsmu.Lock()
-	defer h.connsmu.Unlock()
 	c, found := h.conns[hh]
 	if !found {
+		h.connsmu.Unlock()
 		// should not happen, just be cautious for now.
 		log.Printf("l2conn: disconnecting a disconnected 0x%04X connection", hh)
 		return nil
 	}
 	delete(h.conns, hh)
-	c.rxPDU = nil
-	close(c.aclc)
+	c.stop()
+	h.connsmu.Unlock()
 	h.setAdvertiseEnable(true)
 	return nil
 }
@@ -381,6 +417,11 @@ func (h *HCI) handleL2CAP(b []byte) error {
 		log.Printf("l2conn: got data for disconnected handle: 0x%04x", a.attr)
 		return nil
 	}
+	select {
+	case <-c.done:
+		return nil
+	default:
+	}
 	pb := a.flags & aclPBMask
 	pdu := a.b
 	if pb == aclPBContinuation {
@@ -408,8 +449,19 @@ func (h *HCI) handleL2CAP(b []byte) error {
 	if cid == 5 {
 		return c.handleSignal(pdu)
 	}
-	c.aclc <- pdu[l2capHeaderLen:]
-	return nil
+	// Never block the HCI reader: transmit completion events share this loop.
+	select {
+	case c.aclc <- pdu[l2capHeaderLen:]:
+		return nil
+	default:
+		c.stop()
+		go func() {
+			if err := c.Close(); err != nil {
+				log.Printf("l2conn: receive queue overflow cleanup: %v", err)
+			}
+		}()
+		return fmt.Errorf("l2conn: receive queue full for handle 0x%04X, disconnecting", a.attr)
+	}
 }
 
 func (h *HCI) trace(fmt string, v ...interface{}) {
