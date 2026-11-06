@@ -64,7 +64,7 @@ func (c *central) loop() {
 			c.Close()
 			break
 		}
-		if rsp := c.handleReq(b[:n]); rsp != nil {
+		if rsp := c.handleReq(b[:n:n]); rsp != nil {
 			c.l2conn.Write(rsp)
 		}
 	}
@@ -72,10 +72,27 @@ func (c *central) loop() {
 
 // handleReq dispatches a raw request from the central shim
 // to an appropriate handler, based on its type.
-// It panics if len(b) == 0.
 func (c *central) handleReq(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	reqType, req := b[0], b[1:]
+	if !validATTParamLength(reqType, len(req)) {
+		if reqType == attOpWriteCmd {
+			return nil
+		}
+		return attErrorRsp(reqType, 0, attEcodeInvalidPDU)
+	}
+	switch reqType {
+	case attOpFindInfoReq, attOpFindByTypeValueReq, attOpReadByTypeReq, attOpReadByGroupReq:
+		start, end := readHandleRange(req)
+		if start == 0 || start > end {
+			return attErrorRsp(reqType, start, attEcodeInvalidHandle)
+		}
+	}
+
 	var resp []byte
-	switch reqType, req := b[0], b[1:]; reqType {
+	switch reqType {
 	case attOpMtuReq:
 		resp = c.handleMTU(req)
 	case attOpFindInfoReq:
@@ -98,6 +115,23 @@ func (c *central) handleReq(b []byte) []byte {
 		resp = attErrorRsp(reqType, 0x0000, attEcodeReqNotSupp)
 	}
 	return resp
+}
+
+func validATTParamLength(op byte, n int) bool {
+	switch op {
+	case attOpMtuReq, attOpReadReq:
+		return n == 2
+	case attOpFindInfoReq, attOpReadBlobReq:
+		return n == 4
+	case attOpReadByTypeReq, attOpReadByGroupReq:
+		return n == 6 || n == 20
+	case attOpFindByTypeValueReq:
+		return n >= 6
+	case attOpWriteReq, attOpWriteCmd:
+		return n >= 2
+	default:
+		return true // Unsupported opcodes are handled by handleReq.
+	}
 }
 
 func (c *central) handleMTU(b []byte) []byte {

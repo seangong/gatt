@@ -253,3 +253,69 @@ func TestServing(t *testing.T) {
 		}
 	}
 }
+
+func TestHandleReqLengthValidation(t *testing.T) {
+	service := NewService(attrGAPUUID)
+	characteristic := service.AddCharacteristic(attrDeviceNameUUID)
+	var writes int
+	characteristic.HandleWriteFunc(func(_ Request, data []byte) byte {
+		writes++
+		if len(data) != 0 {
+			t.Errorf("write value = %x, want empty", data)
+		}
+		return StatusSuccess
+	})
+	c := newCentral(generateAttributes([]*Service{service}, 1), nil, nil)
+
+	for _, tt := range []struct {
+		name string
+		send string
+		want string
+	}{
+		{"empty PDU", "", ""},
+		{"short MTU", "0217", "0102000004"},
+		{"long MTU", "02170000", "0102000004"},
+		{"short find information", "04010003", "0104000004"},
+		{"long find information", "040100030000", "0104000004"},
+		{"short find by type value", "060100030000", "0106000004"},
+		{"find by type value with empty value", "06010003000028", "010601000a"},
+		{"short read by type", "080100030000", "0108000004"},
+		{"invalid read by type UUID length", "0801000300002800", "0108000004"},
+		{"read by type with 128-bit UUID", "080100030000000000000000000000000000000000", "010801000a"},
+		{"short read", "0a01", "010a000004"},
+		{"long read", "0a010000", "010a000004"},
+		{"short read blob", "0c010000", "010c000004"},
+		{"long read blob", "0c0100000000", "010c000004"},
+		{"short read by group", "100100030000", "0110000004"},
+		{"invalid read by group UUID length", "1001000300002800", "0110000004"},
+		{"write request without handle", "12", "0112000004"},
+		{"write request with incomplete handle", "1203", "0112000004"},
+		{"write command without handle", "52", ""},
+		{"write command with incomplete handle", "5203", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf [672]byte
+			n, err := hex.Decode(buf[:], []byte(tt.send))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := c.handleReq(buf[:n])
+			if hex.EncodeToString(got) != tt.want || (tt.want == "" && got != nil) {
+				t.Errorf("handleReq(%s) = %#v, want %q", tt.send, got, tt.want)
+			}
+		})
+	}
+	if writes != 0 {
+		t.Errorf("malformed write PDUs called the handler %d times", writes)
+	}
+
+	if got := c.handleReq([]byte{attOpWriteReq, byte(characteristic.vh), 0}); hex.EncodeToString(got) != "13" {
+		t.Errorf("empty write request response = %x, want 13", got)
+	}
+	if got := c.handleReq([]byte{attOpWriteCmd, byte(characteristic.vh), 0}); got != nil {
+		t.Errorf("empty write command response = %x, want nil", got)
+	}
+	if writes != 2 {
+		t.Errorf("empty write PDUs called the handler %d times, want 2", writes)
+	}
+}
