@@ -1,171 +1,392 @@
-# Package gatt provides a Bluetooth Low Energy GATT implementation.
+# gatt
 
-Gatt (Generic Attribute Profile) is the protocol used to write BLE peripherals (servers) and centrals (clients).
+A Go implementation of Bluetooth Low Energy GATT for peripherals (servers) and
+centrals (clients).
 
-As a peripheral, you can create services, characteristics, and descriptors,
-advertise, accept connections, and handle requests.
+- **Peripheral:** define services, characteristics and descriptors; advertise;
+  handle reads, writes and subscriptions.
+- **Central:** scan, connect, discover attributes, read and write values, and
+  subscribe to value changes.
 
-As a central, you can scan, connect, discover services, and make requests.
+Import path: `github.com/seangong/gatt/v2`.
 
-## SETUP
+## Platforms and compatibility
 
-### gatt supports both Linux and OS X.
+This README describes the current source tree. Older tagged releases may not
+contain all the APIs and fixes documented here.
 
-### On Linux:
-To gain complete and exclusive control of the HCI device, gatt uses
-HCI_CHANNEL_USER (introduced in Linux v3.14) instead of HCI_CHANNEL_RAW.
-Those who must use an older kernel may patch in these relevant commits
-from Marcel Holtmann:
+| Platform | Implementation | Important limits |
+| --- | --- | --- |
+| Linux | Direct HCI access; ATT/GATT handled by this package | Requires exclusive access to a compatible LE controller and suitable kernel, driver and firmware. |
+| macOS | Legacy XPC integration with `com.apple.blued` | Uses private system interfaces; compatibility with a particular macOS release must be verified. Capabilities differ from Linux. |
 
-    Bluetooth: Introduce new HCI socket channel for user operation
-    Bluetooth: Introduce user channel flag for HCI devices
-    Bluetooth: Refactor raw socket filter into more readable code
+Support for BLE alone does not guarantee interoperability with every controller
+or remote device. Test the hardware, firmware, operating system, device role and
+GATT operations used by your application. A working independent CoreBluetooth
+client does not establish compatibility of this package's macOS backend.
 
-Note that because gatt uses HCI_CHANNEL_USER, once gatt has opened the
-device no other program may access it.
+Current limitations include:
 
-Before starting a gatt program, make sure that your BLE device is down:
+- **Linux security:** no complete BLE pairing, bonding or key-management flow.
+  Do not assume that devices or characteristics requiring an encrypted or
+  authenticated link will work.
+- **Linux advertising:** built-in paths use legacy advertising and scanning;
+  extended and periodic advertising are not implemented.
+- **Linux writes:** the server does not implement Read Multiple, Prepare Write,
+  Execute Write or Signed Write. The client sends single ATT writes rather than
+  implementing reliable long writes.
+- **Linux client APIs:** `DiscoverIncludedServices` is unimplemented and returns
+  `nil, nil`; `ReadRSSI` returns `-1`. Scan and discovery UUID filters are not
+  implemented, so filter returned results in your application.
+- **Controller capacity:** Linux transmit-buffer size and packet-count settings
+  are fixed in the implementation rather than fully negotiated from capacity.
+- **macOS APIs:** `DiscoverIncludedServices` and `SetMTU` are unimplemented;
+  `SetIndicateValue` is a placeholder that returns `nil` without subscribing.
 
-    sudo hciconfig
-    sudo hciconfig hci0 down  # or whatever hci device you want to use
+The presence of an API, or a placeholder returning `nil`, is not evidence that
+an operation is implemented. See the
+[API reference](https://pkg.go.dev/github.com/seangong/gatt/v2) and
+platform-specific source for individual operations.
 
-If you have BlueZ 5.14+ (or aren't sure), stop the built-in
-bluetooth server, which interferes with gatt, e.g.:
+## Installation
 
-    sudo service bluetooth stop
+The current source requires **Go 1.26.4 or newer**, as declared in
+[`go.mod`](go.mod). Run dependency commands from your application's module.
 
-Because gatt programs administer network devices, they must
-either be run as root, or be granted appropriate capabilities:
-
-    sudo <executable>
-    # OR
-    sudo setcap 'cap_net_raw,cap_net_admin=eip' <executable>
-    <executable>
-
-## Usage
-
-Install version 2.0.0:
+For a reproducible snapshot containing the shutdown, read-status, CCCD,
+indication and advertising-initialization fixes described below:
 
 ```sh
-go get github.com/seangong/gatt/v2
+go get github.com/seangong/gatt/v2@c03f1f502cb4
+go list -m github.com/seangong/gatt/v2
 ```
 
-Use the v2 module path in imports:
+That commit resolves to `v2.0.1-0.20261107051419-c03f1f502cb4`. You can use
+`@master` to follow development, but pin the resolved version for reproducible
+builds. See [Go version queries](https://go.dev/ref/mod#version-queries).
+
+For a published release:
+
+```sh
+go get github.com/seangong/gatt/v2@latest
+```
+
+`@latest` follows Go's release-version rules; it does not mean the latest commit
+on `master`. In particular, `v2.0.0` does not contain the current `StopContext`
+implementation or the subsequent Linux fixes.
 
 ```go
 import "github.com/seangong/gatt/v2"
 ```
 
-Please see [pkg.go.dev](https://pkg.go.dev/github.com/seangong/gatt/v2) for documentation.
+## Linux setup
 
-### Final shutdown on Linux
+Use a kernel with HCI user-channel support, introduced in Linux 3.14, and a
+working driver and firmware for your controller. UART controllers must already
+be attached by the platform's Bluetooth initialization process.
 
-Linux devices provide the optional `StopContext(context.Context) error` and
-`Stop() error` methods. The `Device` interface is unchanged, so callers can use
-a capability assertion. `StopContext` is not available in v2.0.0; consumers
-pinned to that version need a release containing these changes to use it:
+The package normally binds `HCI_CHANNEL_USER` and takes exclusive control of the
+selected adapter. It cannot share that adapter with BlueZ or another owner.
+The implementation has a raw-channel fallback for older kernels; that does not
+guarantee compatibility with those systems.
+
+Inspect the adapters and select the one your application will own:
+
+```sh
+hciconfig
+sudo hciconfig hci0 down
+```
+
+Replace `hci0` with the intended adapter. If the system Bluetooth service manages
+it, stop that service before starting the application. For example, on a system
+using systemd:
+
+```sh
+sudo systemctl stop bluetooth
+```
+
+On systems using the older service interface, use `sudo service bluetooth stop`
+instead. Stopping the service affects the Bluetooth devices it manages.
+
+Run the compiled application as root:
+
+```sh
+sudo ./gatt-server
+```
+
+Alternatively, on Linux filesystems supporting file capabilities:
+
+```sh
+sudo setcap 'cap_net_raw,cap_net_admin=eip' ./gatt-server
+./gatt-server
+```
+
+Reapply capabilities after replacing the executable. In code,
+`LnxDeviceID(0, true)` selects `hci0` and checks LE support; `-1` requests automatic
+adapter selection.
+
+## macOS setup
+
+Build natively with CGO enabled and an Apple C toolchain. Choose the client or
+server role through the macOS options shown in
+[`examples/option/option_darwin.go`](examples/option/option_darwin.go).
+The legacy XPC backend needs separate verification on your macOS release; the
+Linux lifecycle and interoperability results do not apply to it automatically.
+
+## Minimal Linux server
+
+Save this as `main.go` in your application module after installing a snapshot
+containing `StopContext`. It advertises one service with a read-only
+characteristic and releases the controller on SIGINT or SIGTERM.
 
 ```go
-if stopper, ok := d.(interface {
-    StopContext(context.Context) error
-}); ok {
-    if err := stopper.StopContext(ctx); err != nil {
-        log.Printf("Bluetooth shutdown: %v", err)
-    }
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/seangong/gatt/v2"
+)
+
+func main() {
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	d, err := gatt.NewDevice(gatt.LnxDeviceID(0, true))
+	if err != nil {
+		log.Printf("open Bluetooth: %v", err)
+		return
+	}
+	stopper := d.(interface {
+		StopContext(context.Context) error
+	})
+	defer func() {
+		if err := stopper.StopContext(context.Background()); err != nil {
+			log.Printf("stop Bluetooth: %v", err)
+		}
+	}()
+
+	serviceUUID := gatt.MustParseUUID("9A3D0001-7F31-4EB2-9F66-14B489BDF001")
+	valueUUID := gatt.MustParseUUID("9A3D0002-7F31-4EB2-9F66-14B489BDF001")
+	service := gatt.NewService(serviceUUID)
+	service.AddCharacteristic(valueUUID).SetValue([]byte("ready"))
+	setup := make(chan error, 1)
+	if err := d.Init(func(device gatt.Device, state gatt.State) {
+		if state != gatt.StatePoweredOn {
+			return
+		}
+		if err := device.AddService(service); err != nil {
+			setup <- err
+			return
+		}
+		setup <- device.AdvertiseNameAndServices("Gopher", []gatt.UUID{service.UUID()})
+	}); err != nil {
+		log.Printf("initialize Bluetooth: %v", err)
+		return
+	}
+
+	select {
+	case err := <-setup:
+		if err != nil {
+			log.Printf("start advertising: %v", err)
+			return
+		}
+	case <-ctx.Done():
+		return
+	}
+	log.Print("advertising Gopher; press Ctrl+C to stop")
+	<-ctx.Done()
 }
 ```
 
-Final shutdown rejects new operations, cancels connection IO, and gives all
-connections one shared graceful deadline. A successful Disconnect command is
-not enough: shutdown waits for `DisconnectionComplete`. After the graceful
-deadline, or a transport failure, it closes the command processor and the
-pollable HCI socket, then joins the library's receiver and protocol workers.
-The graceful phase currently has a four-second budget, leaving room within the
-five-second shutdown policy for local cleanup. Forced shutdown reports
-`context.DeadlineExceeded`; underlying errors remain available through
-`errors.Is`. The HCI socket must support runtime polling and IO deadlines.
+```sh
+go build -o gatt-server .
+sudo ./gatt-server
+```
 
-Concurrent shutdown callers share the same cleanup and result. Canceling the
-context passed to `StopContext` stops only that caller's wait; cleanup continues.
-Stopping advertising or removing services alone does not release the device.
-Initialization is allowed once per device. Final shutdown is irreversible;
-construct a new device to start again.
+Configure services and handlers before advertising. Legacy advertising and
+scan-response packets each have a 31-byte budget, including field headers.
+Advertise a discovery UUID that fits; clients can discover the remaining
+services after connecting.
 
-Application callbacks are outside the core shutdown wait. `Request.Context()`
-is canceled on connection shutdown so read, write, and notification handlers
-can stop blocking work cooperatively. Callbacks that ignore cancellation may
-continue after shutdown returns; the library bounds their concurrency and keeps
-their slots occupied until they actually return. Lifecycle callbacks remain
-ordered per connection. Server `CentralConnected` finishes before ATT requests
-start; client `PeripheralConnected` can make synchronous discovery requests.
-`Disconnected` and `PoweredOff` callbacks may run after shutdown returns, and
-can themselves request shutdown without waiting on their own execution.
+## Linux reads, writes and subscriptions
 
-## Examples
+Dynamic read handlers receive `ReadRequest.Cap` and `ReadRequest.Offset`. Return
+the requested slice bounded by `Cap`; use `ResponseWriter.SetStatus` for an
+invalid offset or another failure. The library does not apply the offset a
+second time to a dynamic handler's response.
 
-### Build and run the examples on a native environment (Linux or OS X)
+Read and write handlers use API statuses, not raw ATT error codes:
 
-Go is a compiled language, which means to run the examples you need to build them first.
+| API status | Linux ATT result |
+| --- | --- |
+| `StatusSuccess` | Success |
+| `StatusInvalidOffset` | Invalid Offset (`0x07`) |
+| `StatusUnexpectedError`, or an unknown status | Unlikely Error (`0x0E`) |
 
-    # Build the sample server.
-    go build examples/server.go
-    # Start the sample server.
-    sudo ./server
+Write-without-response commands never receive an ATT response, including when a
+handler rejects the write. Use an application-level acknowledgement when the
+sender needs to know the business result.
 
-Alternatively, you can use "go run" to build and run the examples in a single step:
+The default ATT MTU is 23. Linux accepts MTUs up to 517, while a single
+notification or indication value is limited to `min(MTU - 3, 512)` bytes.
+Read `Notifier.Cap()` after negotiation rather than assuming a fixed size.
+Oversized writes return `0, io.ErrShortWrite` without sending a value. The library
+does not split a value into multiple ATT notifications.
 
-    # Build and run the sample server.
-    sudo go run examples/server.go
+`HandleNotify` declares both notification and indication support. On Linux,
+CCCD configuration is kept per connection:
 
-Discoverer and explorer demonstrates central (client) functions:
+| CCCD | Delivery mode |
+| --- | --- |
+| `0` | Unsubscribed; the notifier is stopped |
+| `1` | Notification |
+| `2` | Indication |
+| `3` | Notification |
 
-    # Discover surrounding peripherals.
-    sudo go run examples/discoverer.go
+For indications, `Notifier.Write` returns after transmission, without waiting
+for confirmation. Only one indication may await confirmation per connection,
+across all characteristics. Another indication returns `ErrIndicationPending`;
+the caller can retry later with appropriate pacing. Notifications remain
+possible while an indication is pending. A 30-second confirmation timeout or
+an uncertain indication write failure closes the connection.
 
-    # Connect to and explorer a peripheral device.
-    sudo go run examples/explorer.go <peripheral ID>
+Handlers should observe `Request.Context()` when doing blocking work.
+Notification handlers should also check `Notifier.Done()` when unsubscribed.
+A transport write already in progress may finish after `Done()` becomes true.
 
-### Cross-compile and deploy to a target device
+## Linux shutdown and reopening
 
-    # Build and run the server example on a ARMv5 target device.
-    GOARCH=arm GOARM=5 GOOS=linux go build examples/server.go
-    cp server <target device>
-    # Start the server on the target device
-    sudo ./server
+Linux devices expose optional `StopContext(context.Context) error` and
+`Stop() error` methods. They are not part of the portable `Device` interface;
+use a capability assertion as in the example above. Other platforms do not
+provide the same shutdown contract.
 
-See the server.go, discoverer.go, and explorer.go in the examples/
-directory for writing server or client programs that run on Linux
-and OS X.
+- `StopContext` rejects new operations, cancels connection IO and starts one
+  shared shutdown. Concurrent callers wait for the same cleanup and result.
+- Graceful shutdown waits for physical disconnection events with a four-second
+  grace budget. If it cannot finish, it closes the pollable HCI transport and
+  joins the library's receiver and protocol workers. Forced timeout errors
+  remain identifiable with `errors.Is(err, context.DeadlineExceeded)`.
+- Canceling the caller's context only ends that caller's wait; shared cleanup
+  continues. Allow cleanup to finish before exiting the process.
+- Stopping advertising or removing services does not release the controller.
+  After final shutdown, construct a new device to reopen it. `Init` is allowed
+  once per device.
+- Application callbacks run outside the core shutdown wait. Handlers that
+  ignore cancellation may continue after shutdown returns; their concurrency
+  is bounded until they actually return.
+- Lifecycle callbacks remain ordered per connection. Server `CentralConnected`
+  finishes before ATT handling starts; client `PeripheralConnected` may issue
+  synchronous discovery requests. `Disconnected` and `PoweredOff` callbacks
+  may finish after shutdown returns and may themselves request shutdown.
 
-Users, especially on Linux platforms, seeking finer-grained control
-over the devices can see the examples/server_lnx.go for the usage
-of Option, which are platform specific.
+`Scan`, `Connect` and `CancelConnection` do not return errors through the portable
+`Device` interface. Returning from a call is not a connection-success signal;
+observe completion callbacks and use application-level timeouts where needed.
 
-See the rest of the docs for other options and finer-grained control.
+## Repository examples
 
-## Note
-Note that some BLE central devices, particularly iOS, may aggressively
-cache results from previous connections. If you change your services or
-characteristics, you may need to reboot the other device to pick up the
-changes. This is a common source of confusion and apparent bugs. For an
-OS X central, see http://stackoverflow.com/questions/20553957.
+From this repository, build each example as a single file:
 
-## Known Issues
+```sh
+go build -o /tmp/gatt-example-server examples/server.go
+go build -o /tmp/gatt-discoverer examples/discoverer.go
+go build -o /tmp/gatt-explorer examples/explorer.go
+```
 
-Currently OS X vesion  does not support subscribing to indications. 
-Please check [#32](https://github.com/seangong/gatt/issues/32) for the status of this issue.
+On Linux, prepare the adapter and run with the permissions described above:
 
-## REFERENCES
+```sh
+sudo /tmp/gatt-example-server
+sudo /tmp/gatt-discoverer
+sudo /tmp/gatt-explorer '<peripheral ID>'
+```
 
-gatt started life as a port of bleno, to which it is indebted:
-https://github.com/sandeepmistry/bleno. If you are having
-problems with gatt, particularly around installation, issues
-filed with bleno might also be helpful references.
+These examples demonstrate individual APIs; use the shutdown and error handling
+shown above when integrating them into an application. For Linux-specific
+options, see [`examples/server_lnx.go`](examples/server_lnx.go) and
+[`examples/option/option_linux.go`](examples/option/option_linux.go).
 
-To try out your GATT server, it is useful to experiment with a
-generic BLE client. LightBlue is a good choice. It is available
-free for both iOS and OS X.
+For an ARM64 Linux target:
 
-gatt is similar to [bleno](https://github.com/sandeepmistry/bleno) and [noble](https://github.com/sandeepmistry/noble), which offer BLE GATT implementations for node.js.
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /tmp/gatt-server-arm64 examples/server.go
+```
 
-Gatt is released under a [BSD-style license](./LICENSE.md).
+Copy the executable to the target, prepare its controller, and run it there.
+Building successfully does not establish hardware compatibility.
+
+## Troubleshooting
+
+### Advertising fails with HCI `0x200A` / status `0x0C`
+
+`0x200A` controls both enabling and disabling advertising. Inspect the error
+context (`enabled=false`, `enabled=true`, `configure` or `restore`) and capture
+the HCI command and response with `btmon` where available.
+
+Current initialization skips a redundant disable before the first advertising
+configuration and checks configuration return statuses. Controllers can still
+reject commands because of their state or parameters; the status code alone
+does not identify the cause. Attribute-table logs show local service setup,
+not successful advertising.
+
+### Services or characteristic properties look out of date
+
+Clients may cache GATT attributes across connections. If the service database
+changes, follow the client's cache-invalidation procedure and rediscover the
+attributes. Reconnecting alone may retain cached values. Confirm properties
+and CCCD writes on the wire before diagnosing a subscription failure.
+
+### `go get ...@master` still selects an older commit
+
+Check the selected dependency, branch query and remote branch:
+
+```sh
+go list -m github.com/seangong/gatt/v2
+go list -m -json github.com/seangong/gatt/v2@master
+git ls-remote https://github.com/seangong/gatt.git refs/heads/master
+```
+
+A module proxy may return an older branch resolution. Pin the intended commit
+or resolved pseudo-version. `GOPROXY=direct` bypasses the module proxy, but
+requires repository and checksum-service connectivity. With a comma-separated
+`GOPROXY` list, a successful proxy response does not trigger a direct lookup;
+fallback occurs on HTTP 404 or 410. See
+[Go's proxy protocol](https://go.dev/ref/mod#communicating-with-proxies).
+
+Editing a separate local clone does not update an application's module-cache
+dependency. Update its required version or explicitly configure a local
+replacement before rebuilding.
+
+## Development checks
+
+Build the packages on the intended platform:
+
+```sh
+go build ./...
+```
+
+On Linux, run tests with vet disabled while the existing HCI logging vet issues
+remain. Race testing also requires a supported architecture and a C toolchain:
+
+```sh
+go test -vet=off ./...
+go test -race -vet=off ./...
+```
+
+These commands do not establish a clean `go vet` result. On macOS, existing XPC
+tests also have compilation errors, so `go test ./...` is not currently a clean
+check. Keep controller/peer interoperability testing separate from unit tests;
+record the hardware, firmware, role and negotiated MTU.
+
+## Background and license
+
+gatt started as a Go port of [bleno](https://github.com/sandeepmistry/bleno).
+Related BLE projects include [noble](https://github.com/sandeepmistry/noble).
+
+Released under the [BSD-style license](LICENSE.md).
