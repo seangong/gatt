@@ -54,8 +54,7 @@ type HCI struct {
 	workers         sync.WaitGroup
 	callbacks       chan struct{}
 	scanning        bool
-	connecting      bool
-	pendingSource   *PlatData // Original Connect argument, protected by connsmu.
+	pending         *connectionAttempt // Protected by connsmu.
 
 	adv   bool
 	advmu *sync.Mutex
@@ -72,6 +71,46 @@ type PlatData struct {
 	RSSI        int8
 
 	Conn io.ReadWriteCloser
+}
+
+// connectionAttempt keeps one outgoing attempt and its cancellation together.
+// All fields and channel publications are protected by HCI.connsmu.
+type connectionAttempt struct {
+	source        *PlatData
+	address       [6]byte
+	addressType   uint8
+	createDone    chan struct{}
+	done          chan struct{}
+	conn          *conn
+	terminalErr   error
+	cancelStarted bool
+	cancelDone    chan struct{}
+	cancelErr     error
+}
+
+func newConnectionAttempt(pd *PlatData) *connectionAttempt {
+	return &connectionAttempt{
+		source: pd, address: pd.Address, addressType: pd.AddressType,
+		createDone: make(chan struct{}), done: make(chan struct{}), cancelDone: make(chan struct{}),
+	}
+}
+
+func (a *connectionAttempt) created() {
+	select {
+	case <-a.createDone:
+	default:
+		close(a.createDone)
+	}
+}
+
+func (a *connectionAttempt) complete(c *conn, err error) {
+	select {
+	case <-a.done:
+	default:
+		a.conn = c
+		a.terminalErr = err
+		close(a.done)
+	}
 }
 
 func NewHCI(devID int, chk bool, maxConn int) (*HCI, error) {
@@ -235,8 +274,11 @@ func (h *HCI) closeTransport() {
 		h.c.Close()
 		h.connsmu.Lock()
 		h.transportClosed = true
-		h.connecting = false
-		h.pendingSource = nil
+		if a := h.pending; a != nil {
+			a.created()
+			a.complete(nil, io.ErrClosedPipe)
+			h.pending = nil
+		}
 		for handle, c := range h.conns {
 			c.terminate(io.ErrClosedPipe)
 			delete(h.conns, handle)
@@ -248,7 +290,7 @@ func (h *HCI) closeTransport() {
 
 func (h *HCI) disconnectAll(ctx context.Context) error {
 	h.connsmu.Lock()
-	scanning, connecting := h.scanning, h.connecting
+	scanning, pending := h.scanning, h.pending
 	h.connsmu.Unlock()
 	h.advmu.Lock()
 	advertising := h.adv
@@ -261,9 +303,6 @@ func (h *HCI) disconnectAll(ctx context.Context) error {
 	if advertising {
 		commands = append(commands, cmd.LESetAdvertiseEnable{})
 	}
-	if connecting {
-		commands = append(commands, cmd.LECreateConnCancel{})
-	}
 	for _, cp := range commands {
 		response, err := h.c.SendShutdownContext(ctx, cp)
 		if err != nil {
@@ -273,13 +312,18 @@ func (h *HCI) disconnectAll(ctx context.Context) error {
 			return fmt.Errorf("hci: shutdown command 0x%04X returned status [% X]", cp.Opcode(), response)
 		}
 	}
+	if pending != nil {
+		if err := h.cancelPendingConnection(ctx, pending); err != nil {
+			return err
+		}
+	}
 	for {
 		h.connsmu.Lock()
 		connections := make([]*conn, 0, len(h.conns))
 		for _, c := range h.conns {
 			connections = append(connections, c)
 		}
-		pendingConnection := h.connecting
+		pendingConnection := h.pending != nil
 		h.connsmu.Unlock()
 		if len(connections) == 0 && !pendingConnection {
 			return nil
@@ -385,12 +429,12 @@ func (h *HCI) Connect(pd *PlatData) error {
 		h.connsmu.Unlock()
 		return io.ErrClosedPipe
 	}
-	if h.connecting {
+	if h.pending != nil {
 		h.connsmu.Unlock()
 		return errors.New("hci: connection attempt already pending")
 	}
-	h.connecting = true
-	h.pendingSource = pd
+	a := newConnectionAttempt(pd)
+	h.pending = a
 	h.connsmu.Unlock()
 	// Keep the caller's parsed name without sharing mutable advertisement data.
 	report := *pd
@@ -413,24 +457,31 @@ func (h *HCI) Connect(pd *PlatData) error {
 			MinimumCELength:       0x0000,         // N x 0.625ms
 			MaximumCELength:       0x0000,         // N x 0.625ms
 		})
+	h.connsmu.Lock()
+	a.created()
 	if err != nil {
-		h.connsmu.Lock()
-		if h.pendingSource == pd {
-			h.connecting = false
-			h.pendingSource = nil
+		a.complete(nil, nil)
+		if h.pending == a && !a.cancelStarted {
+			h.pending = nil
 		}
-		h.initLifecycle()
-		select {
-		case h.changed <- struct{}{}:
-		default:
-		}
-		h.connsmu.Unlock()
 	}
+	h.initLifecycle()
+	select {
+	case h.changed <- struct{}{}:
+	default:
+	}
+	h.connsmu.Unlock()
 	return err
 }
 
 func (h *HCI) CancelConnection(pd *PlatData) error {
 	h.connsmu.Lock()
+	if a := h.pending; a != nil && a.source == pd {
+		h.connsmu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), hciCloseTimeout)
+		defer cancel()
+		return h.cancelPendingConnection(ctx, a)
+	}
 	target := pd.Conn
 	for _, c := range h.conns {
 		if c.origin == pd {
@@ -443,6 +494,115 @@ func (h *HCI) CancelConnection(pd *PlatData) error {
 		return nil
 	}
 	return target.Close()
+}
+
+// cancelPendingConnection is also used by shutdown. The attempt stays reserved
+// until both its terminal event and the cancellation transaction have finished:
+// a queued cancellation must never reach a later Create Connection.
+func (h *HCI) cancelPendingConnection(ctx context.Context, a *connectionAttempt) (err error) {
+	h.connsmu.Lock()
+	if a.cancelStarted {
+		h.connsmu.Unlock()
+		select {
+		case <-a.cancelDone:
+			return a.cancelErr
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	a.cancelStarted = true
+	h.connsmu.Unlock()
+
+	// Context cancellation alone cannot interrupt the command's device Write.
+	// Fail closed so the transport's Close releases that write as well.
+	watchDone := make(chan struct{})
+	stopWatch := context.AfterFunc(ctx, func() {
+		h.requestClose(fmt.Errorf("hci: cancel pending connection: %w", ctx.Err()))
+		close(watchDone)
+	})
+	defer func() {
+		if !stopWatch() {
+			<-watchDone
+		}
+		if ctx.Err() != nil {
+			err = errors.Join(ctx.Err(), err)
+		}
+		if err != nil {
+			h.requestClose(fmt.Errorf("hci: cancel pending connection: %w", err))
+		}
+		h.connsmu.Lock()
+		select {
+		case <-a.cancelDone:
+		default:
+			a.cancelErr = err
+			close(a.cancelDone)
+		}
+		select {
+		case <-a.done:
+			if h.pending == a {
+				h.pending = nil
+			}
+		default:
+		}
+		h.initLifecycle()
+		select {
+		case h.changed <- struct{}{}:
+		default:
+		}
+		h.connsmu.Unlock()
+	}()
+
+	select {
+	case <-a.createDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-a.done:
+		return h.disconnectAttempt(ctx, a)
+	default:
+	}
+
+	response, err := h.c.SendShutdownContext(ctx, cmd.LECreateConnCancel{})
+	if err != nil {
+		return fmt.Errorf("send LE Create Connection Cancel: %w", err)
+	}
+	if len(response) == 0 {
+		return errors.New("LE Create Connection Cancel returned no status")
+	}
+	var statusErr error
+	if response[0] != 0 {
+		statusErr = fmt.Errorf("LE Create Connection Cancel returned status 0x%02x", response[0])
+		// A successful connection can win before its event reaches the reader.
+		// Command Disallowed is harmless only once that attempt is terminal.
+		if response[0] != 0x0c {
+			return statusErr
+		}
+	}
+	select {
+	case <-a.done:
+		return h.disconnectAttempt(ctx, a)
+	case <-ctx.Done():
+		return errors.Join(statusErr, ctx.Err())
+	}
+}
+
+func (h *HCI) disconnectAttempt(ctx context.Context, a *connectionAttempt) error {
+	h.connsmu.Lock()
+	c, err := a.conn, a.terminalErr
+	h.connsmu.Unlock()
+	if c == nil {
+		return err
+	}
+	if err := c.disconnect(ctx); err != nil {
+		return err
+	}
+	select {
+	case <-c.linkDone:
+		return c.linkErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (h *HCI) SendRawCommand(c cmd.CmdParam) ([]byte, error) {
@@ -624,17 +784,16 @@ func (h *HCI) handleConnection(b []byte) {
 	}
 	h.connsmu.Lock()
 	h.initLifecycle()
-	var origin *PlatData
-	if ep.Status != 0 {
-		h.connecting = false
-		h.pendingSource = nil
-	} else if ep.Role == 0x00 && (h.pendingSource == nil ||
-		h.pendingSource.Address == ep.PeerAddress && h.pendingSource.AddressType == ep.PeerAddressType) {
-		origin = h.pendingSource
-		h.connecting = false
-		h.pendingSource = nil
-	}
+	a := h.pending
+	matches := a != nil && (ep.Status != 0 || ep.Role == 0x00 &&
+		a.address == ep.PeerAddress && a.addressType == ep.PeerAddressType)
 	if ep.Status != 0 || h.transportClosed || h.closeCause != nil {
+		if matches {
+			a.complete(nil, nil)
+			if !a.cancelStarted {
+				h.pending = nil
+			}
+		}
 		select {
 		case h.changed <- struct{}{}:
 		default:
@@ -643,12 +802,20 @@ func (h *HCI) handleConnection(b []byte) {
 		return
 	}
 	c := newConn(h, ep.ConnectionHandle)
-	c.origin = origin
+	canceling := false
+	if matches {
+		c.origin = a.source
+		a.complete(c, nil)
+		canceling = a.cancelStarted
+		if !canceling {
+			h.pending = nil
+		}
+	}
 	if previous := h.conns[c.attr]; previous != nil {
 		previous.terminate(io.ErrClosedPipe)
 	}
 	h.conns[c.attr] = c
-	closing := h.closed
+	closing := h.closed || canceling
 	if closing {
 		c.stop()
 	}

@@ -302,8 +302,7 @@ func (c *Characteristic) HandleNotify(h NotifyHandler) {
 		uuid:   attrClientCharacteristicConfigUUID,
 		props:  CharRead | CharWrite | CharWriteNR,
 		secure: secure,
-		// FIXME: currently, we always return 0, which is inaccurate.
-		// Each connection should have it's own copy of this value.
+		// Linux reads the current connection's configuration from its notifier.
 		value: []byte{0x00, 0x00},
 		char:  c,
 	}

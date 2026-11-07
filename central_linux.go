@@ -3,9 +3,11 @@ package gatt
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 type security int
@@ -30,7 +32,14 @@ type central struct {
 	callbackSlots chan struct{}
 	notifiers     map[uint16]*notifier
 	notifiersmu   *sync.Mutex
+	indication    *pendingIndication // Protected by notifiersmu.
 }
+
+type pendingIndication struct {
+	timer *time.Timer
+}
+
+const indicationTimeout = 30 * time.Second
 
 func newCentral(a *attrRange, addr net.HardwareAddr, l2conn io.ReadWriteCloser) *central {
 	ctx := context.Background()
@@ -63,6 +72,10 @@ func (c *central) Close() error {
 	c.notifiersmu.Lock()
 	for _, n := range c.notifiers {
 		n.stop()
+	}
+	if c.indication != nil {
+		c.indication.timer.Stop()
+		c.indication = nil
 	}
 	c.notifiersmu.Unlock()
 	return c.l2conn.Close()
@@ -126,24 +139,51 @@ func (n *notifier) Cap() int {
 }
 
 func (c *central) loop() {
+	// Keep confirmations flowing even while an application handler is blocked.
+	// The bounded queue also prevents commands from growing without limit.
+	requests := make(chan []byte, 16)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer c.Close()
+		for {
+			select {
+			case <-c.ctx.Done():
+				return
+			case request := <-requests:
+				if c.ctx.Err() != nil {
+					return
+				}
+				if rsp := c.handleReq(request); rsp != nil && c.ctx.Err() == nil {
+					if n, err := c.l2conn.Write(rsp); err != nil || n != len(rsp) {
+						return
+					}
+				}
+			}
+		}
+	}()
+	defer func() {
+		c.Close()
+		<-done
+	}()
 	for {
 		// L2CAP implementations shall support a minimum MTU size of 48 bytes.
 		// The default value is 672 bytes
 		b := make([]byte, 672)
 		n, err := c.l2conn.Read(b)
 		if n == 0 || err != nil || c.ctx.Err() != nil {
-			c.Close()
-			break
+			return
 		}
-		if rsp := c.handleReq(b[:n:n]); rsp != nil {
-			if c.ctx.Err() != nil {
-				c.Close()
-				break
-			}
-			if n, err := c.l2conn.Write(rsp); err != nil || n != len(rsp) {
-				c.Close()
-				break
-			}
+		if b[0] == attOpHandleCnf {
+			c.handleReq(b[:n:n])
+			continue
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case requests <- b[:n:n]:
+		default:
+			return
 		}
 	}
 }
@@ -155,6 +195,12 @@ func (c *central) handleReq(b []byte) []byte {
 		return nil
 	}
 	reqType, req := b[0], b[1:]
+	if reqType == attOpHandleCnf {
+		if len(req) == 0 {
+			c.confirmIndication()
+		}
+		return nil
+	}
 	if !validATTParamLength(reqType, len(req)) {
 		if reqType == attOpWriteCmd {
 			return nil
@@ -304,6 +350,56 @@ func (c *central) handleFindByTypeValue(b []byte) []byte {
 	return w.Bytes()
 }
 
+func attErrorForStatus(status byte) attEcode {
+	switch status {
+	case StatusSuccess:
+		return attEcodeSuccess
+	case StatusInvalidOffset:
+		return attEcodeInvalidOffset
+	default:
+		return attEcodeUnlikely
+	}
+}
+
+func (c *central) readValue(a attr, capacity, offset int) ([]byte, attEcode) {
+	v := a.value
+	if a.typ.Equal(attrClientCharacteristicConfigUUID) {
+		c.notifiersmu.Lock()
+		var ccc uint16
+		if n := c.notifiers[a.h]; n != nil {
+			ccc = n.ccc
+		}
+		c.notifiersmu.Unlock()
+		v = []byte{byte(ccc), byte(ccc >> 8)}
+	}
+	if v != nil {
+		if offset > len(v) {
+			return nil, attEcodeInvalidOffset
+		}
+		return v[offset:], attEcodeSuccess
+	}
+	rsp := newResponseWriter(capacity)
+	req := &ReadRequest{
+		Request: Request{Central: c},
+		Cap:     capacity,
+		Offset:  offset,
+	}
+	if !c.callHandler(func() {
+		switch target := a.pvt.(type) {
+		case *Characteristic:
+			target.rhandler.ServeRead(rsp, req)
+		case *Descriptor:
+			target.rhandler.ServeRead(rsp, req)
+		}
+	}) {
+		return nil, attEcodeUnlikely
+	}
+	if code := attErrorForStatus(rsp.status); code != attEcodeSuccess {
+		return nil, code
+	}
+	return rsp.bytes(), attEcodeSuccess
+}
+
 // REQ: ReadByType(0x08), StartHandle, EndHandle, Type(UUID)
 // RSP: ReadByType(0x09), LenOfEachDataField, DataField, DataField, ...
 func (c *central) handleReadByType(b []byte) []byte {
@@ -320,26 +416,17 @@ func (c *central) handleReadByType(b []byte) []byte {
 			continue
 		}
 		if (a.secure&CharRead) != 0 && c.security > securityLow {
-			return attErrorRsp(attOpReadByTypeReq, start, attEcodeAuthentication)
+			if uuidLen != -1 {
+				break
+			}
+			return attErrorRsp(attOpReadByTypeReq, a.h, attEcodeAuthentication)
 		}
-		v := a.value
-		if v == nil {
-			rsp := newResponseWriter(valueCap)
-			req := &ReadRequest{
-				Request: Request{Central: c},
-				Cap:     valueCap,
-				Offset:  0,
+		v, code := c.readValue(a, valueCap, 0)
+		if code != attEcodeSuccess {
+			if uuidLen != -1 {
+				break
 			}
-			if !c.callHandler(func() {
-				if target, ok := a.pvt.(*Characteristic); ok {
-					target.rhandler.ServeRead(rsp, req)
-				} else if target, ok := a.pvt.(*Descriptor); ok {
-					target.rhandler.ServeRead(rsp, req)
-				}
-			}) {
-				return attErrorRsp(attOpReadByTypeReq, a.h, attEcodeUnlikely)
-			}
-			v = rsp.bytes()
+			return attErrorRsp(attOpReadByTypeReq, a.h, code)
 		}
 		if uuidLen == -1 {
 			uuidLen = len(v)
@@ -376,24 +463,9 @@ func (c *central) handleRead(b []byte) []byte {
 		return attErrorRsp(attOpReadReq, h, attEcodeAuthentication)
 	}
 	valueCap := min(int(c.mtu)-1, attMaxValueLen)
-	v := a.value
-	if v == nil {
-		req := &ReadRequest{
-			Request: Request{Central: c},
-			Cap:     valueCap,
-			Offset:  0,
-		}
-		rsp := newResponseWriter(valueCap)
-		if !c.callHandler(func() {
-			if target, ok := a.pvt.(*Characteristic); ok {
-				target.rhandler.ServeRead(rsp, req)
-			} else if target, ok := a.pvt.(*Descriptor); ok {
-				target.rhandler.ServeRead(rsp, req)
-			}
-		}) {
-			return attErrorRsp(attOpReadReq, h, attEcodeUnlikely)
-		}
-		v = rsp.bytes()
+	v, code := c.readValue(a, valueCap, 0)
+	if code != attEcodeSuccess {
+		return attErrorRsp(attOpReadReq, h, code)
 	}
 
 	w := newL2capWriter(uint16(valueCap + 1))
@@ -419,33 +491,14 @@ func (c *central) handleReadBlob(b []byte) []byte {
 		return attErrorRsp(attOpReadBlobReq, h, attEcodeAuthentication)
 	}
 	valueCap := min(int(c.mtu)-1, attMaxValueLen)
-	v := a.value
-	if v == nil {
-		req := &ReadRequest{
-			Request: Request{Central: c},
-			Cap:     valueCap,
-			Offset:  int(offset),
-		}
-		rsp := newResponseWriter(valueCap)
-		if !c.callHandler(func() {
-			if target, ok := a.pvt.(*Characteristic); ok {
-				target.rhandler.ServeRead(rsp, req)
-			} else if target, ok := a.pvt.(*Descriptor); ok {
-				target.rhandler.ServeRead(rsp, req)
-			}
-		}) {
-			return attErrorRsp(attOpReadBlobReq, h, attEcodeUnlikely)
-		}
-		v = rsp.bytes()
-		offset = 0 // the server has already adjusted for the offset
+	v, code := c.readValue(a, valueCap, int(offset))
+	if code != attEcodeSuccess {
+		return attErrorRsp(attOpReadBlobReq, h, code)
 	}
 	w := newL2capWriter(uint16(valueCap + 1))
 	w.WriteByteFit(attOpReadBlobRsp)
 	w.Chunk()
 	w.WriteFit(v)
-	if ok := w.ChunkSeek(offset); !ok {
-		return attErrorRsp(attOpReadBlobReq, h, attEcodeInvalidOffset)
-	}
 	w.CommitFit()
 	return w.Bytes()
 }
@@ -535,14 +588,10 @@ func (c *central) handleWrite(reqType byte, b []byte) []byte {
 		if noRsp {
 			return nil
 		}
-		switch status {
-		case StatusSuccess:
-			return []byte{attOpWriteRsp}
-		case StatusInvalidOffset:
-			return attErrorRsp(reqType, h, attEcodeInvalidOffset)
-		default:
-			return attErrorRsp(reqType, h, attEcodeUnlikely)
+		if code := attErrorForStatus(status); code != attEcodeSuccess {
+			return attErrorRsp(reqType, h, code)
 		}
+		return []byte{attOpWriteRsp}
 	}
 
 	// CCC/descriptor write
@@ -550,9 +599,14 @@ func (c *central) handleWrite(reqType byte, b []byte) []byte {
 		return attErrorRsp(reqType, h, attEcodeInvalAttrValueLen)
 	}
 	ccc := binary.LittleEndian.Uint16(value)
-	// char := a.pvt.(*Descriptor).char
+	char := a.pvt.(*Descriptor).char
+	if ccc & ^uint16(gattCCCNotifyFlag|gattCCCIndicateFlag) != 0 ||
+		ccc&gattCCCNotifyFlag != 0 && char.props&CharNotify == 0 ||
+		ccc&gattCCCIndicateFlag != 0 && char.props&CharIndicate == 0 {
+		return attErrorRsp(reqType, h, attEcodeValueNotAllowed)
+	}
 	if ccc&(gattCCCNotifyFlag|gattCCCIndicateFlag) != 0 {
-		if !c.startNotify(&a, int(c.mtu-3)) {
+		if !c.startNotify(&a, int(c.mtu-3), ccc) {
 			return attErrorRsp(reqType, h, attEcodeInsuffResources)
 		}
 	} else {
@@ -564,43 +618,90 @@ func (c *central) handleWrite(reqType byte, b []byte) []byte {
 	return []byte{attOpWriteRsp}
 }
 
-func (c *central) sendNotification(a *attr, data []byte) (int, error) {
+func (c *central) sendNotification(n *notifier, data []byte) (int, error) {
 	mtu := uint16(c.MTU())
 	if len(data) > min(int(mtu)-3, attMaxValueLen) {
 		return 0, io.ErrShortWrite
 	}
+	c.notifiersmu.Lock()
+	if c.ctx.Err() != nil || n.Done() {
+		c.notifiersmu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+	op := byte(attOpHandleNotify)
+	if n.ccc == gattCCCIndicateFlag {
+		if c.indication != nil {
+			c.notifiersmu.Unlock()
+			return 0, ErrIndicationPending
+		}
+		op = attOpHandleInd
+		pending := &pendingIndication{}
+		c.indication = pending
+		pending.timer = time.AfterFunc(indicationTimeout, func() {
+			c.notifiersmu.Lock()
+			if c.indication != pending {
+				c.notifiersmu.Unlock()
+				return
+			}
+			// Mark closure before releasing the lock, so no new write can
+			// reuse the bearer between the timeout and transport shutdown.
+			c.cancel()
+			c.notifiersmu.Unlock()
+			c.Close()
+		})
+	}
+	c.notifiersmu.Unlock()
 	w := newL2capWriter(mtu)
-	w.WriteByteFit(attOpHandleNotify)
-	w.WriteUint16Fit(a.pvt.(*Descriptor).char.vh)
+	w.WriteByteFit(op)
+	w.WriteUint16Fit(n.a.pvt.(*Descriptor).char.vh)
 	w.WriteFit(data)
 	packet := w.Bytes()
-	n, err := c.l2conn.Write(packet)
-	if err == nil && n != len(packet) {
+	written, err := c.l2conn.Write(packet)
+	if err == nil && written != len(packet) {
 		err = io.ErrShortWrite
 	}
-	// Report value bytes to the caller, excluding the ATT opcode and handle.
-	n -= 3
-	if n < 0 {
-		n = 0
+	if op == attOpHandleInd && err != nil {
+		// A partial indication may still be acknowledged. Retire the bearer
+		// rather than allowing that acknowledgement to match a later value.
+		c.notifiersmu.Lock()
+		c.cancel()
+		c.notifiersmu.Unlock()
+		err = errors.Join(err, c.Close())
 	}
-	return n, err
+	// Report value bytes to the caller, excluding the ATT opcode and handle.
+	written -= 3
+	if written < 0 {
+		written = 0
+	}
+	return written, err
+}
+
+func (c *central) confirmIndication() {
+	c.notifiersmu.Lock()
+	defer c.notifiersmu.Unlock()
+	if c.indication != nil {
+		c.indication.timer.Stop()
+		c.indication = nil
+	}
 }
 
 func readHandleRange(b []byte) (start, end uint16) {
 	return binary.LittleEndian.Uint16(b), binary.LittleEndian.Uint16(b[2:])
 }
 
-func (c *central) startNotify(a *attr, maxlen int) bool {
+func (c *central) startNotify(a *attr, maxlen int, ccc uint16) bool {
 	c.notifiersmu.Lock()
 	defer c.notifiersmu.Unlock()
-	if _, found := c.notifiers[a.h]; found {
-		return true
-	}
 	if c.ctx.Err() != nil {
 		return false
 	}
+	if n, found := c.notifiers[a.h]; found {
+		n.ccc = ccc
+		return true
+	}
 	char := a.pvt.(*Descriptor).char
 	n := newNotifier(c, a, maxlen)
+	n.ccc = ccc
 	c.notifiers[a.h] = n
 	if !startCallout(c.callbackSlots, func() { char.nhandler.ServeNotify(Request{Central: c}, n) }) {
 		delete(c.notifiers, a.h)

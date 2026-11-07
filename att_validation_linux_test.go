@@ -3,6 +3,7 @@ package gatt
 import (
 	"bytes"
 	"io"
+	"sync"
 	"testing"
 )
 
@@ -44,10 +45,17 @@ type attValidationConn struct {
 	requests  [][]byte
 	responses [][]byte
 	closed    bool
+	drained   chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func (c *attValidationConn) Read(p []byte) (int, error) {
 	if len(c.requests) == 0 {
+		select {
+		case <-c.drained:
+		case <-c.done:
+		}
 		return 0, io.EOF
 	}
 	request := c.requests[0]
@@ -64,11 +72,15 @@ func (c *attValidationConn) Write(p []byte) (int, error) {
 }
 
 func (c *attValidationConn) Close() error {
-	c.closed = true
+	c.closeOnce.Do(func() {
+		c.closed = true
+		close(c.done)
+	})
 	return nil
 }
 
 func TestCentralLoopContinuesAfterInvalidATTRequests(t *testing.T) {
+	conn := &attValidationConn{drained: make(chan struct{}), done: make(chan struct{})}
 	service := NewService(attrGAPUUID)
 	characteristic := service.AddCharacteristic(attrDeviceNameUUID)
 	var reads int
@@ -81,18 +93,21 @@ func TestCentralLoopContinuesAfterInvalidATTRequests(t *testing.T) {
 	})
 	characteristic.HandleWriteFunc(func(_ Request, value []byte) byte {
 		written = append(written, append([]byte(nil), value...))
+		if bytes.Equal(value, []byte("last")) {
+			close(conn.drained)
+		}
 		return StatusSuccess
 	})
 	attributes := generateAttributes([]*Service{service}, 1)
 	low, high := byte(characteristic.vh), byte(characteristic.vh>>8)
-	conn := &attValidationConn{requests: [][]byte{
+	conn.requests = [][]byte{
 		{attOpReadReq, low},
 		{attOpWriteReq},
 		{attOpWriteCmd, low},
 		{attOpReadReq, low, high},
 		{attOpWriteReq, low, high, 'n', 'e', 'x', 't'},
 		{attOpWriteCmd, low, high, 'l', 'a', 's', 't'},
-	}}
+	}
 
 	newCentral(attributes, nil, conn).loop()
 

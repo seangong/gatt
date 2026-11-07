@@ -515,7 +515,9 @@ func TestHCIShutdownStopsControllerActivityAndRejectsNewCommands(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newShutdownTestHCI(t, false)
 		h.connsmu.Lock()
-		h.scanning, h.connecting = true, true
+		h.scanning = true
+		h.pending = newConnectionAttempt(&PlatData{})
+		h.pending.created()
 		h.connsmu.Unlock()
 		h.advmu.Lock()
 		h.adv = true

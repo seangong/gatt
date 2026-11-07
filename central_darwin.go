@@ -30,7 +30,8 @@ func (c *central) MTU() int     { return c.mtu }
 
 func (n *notifier) Cap() int { return n.maxlen }
 
-func (c *central) sendNotification(a *attr, b []byte) (int, error) {
+func (c *central) sendNotification(n *notifier, b []byte) (int, error) {
+	a := n.a
 	data := make([]byte, len(b))
 	copy(data, b) // have to make a copy, why?
 	c.dev.sendCmd(15, xpc.Dict{

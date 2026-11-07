@@ -104,9 +104,11 @@ func (f NotifyHandlerFunc) ServeNotify(r Request, n Notifier) {
 // notifications about value changes to a connected device.
 // Notifiers are provided by NotifyHandlers.
 type Notifier interface {
-	// Write sends one notification and returns the number of value bytes sent.
+	// Write sends one value and returns the number of value bytes sent.
 	// On Linux, data exceeding Cap returns io.ErrShortWrite without sending
-	// a notification.
+	// a value. CCCD=2 selects indications; Write returns after transmission,
+	// without waiting for confirmation. Until confirmed, another indication
+	// returns ErrIndicationPending. CCCD=1 or 3 selects notifications.
 	Write(data []byte) (int, error)
 
 	// Done reports whether the central has requested not to
@@ -119,22 +121,27 @@ type Notifier interface {
 	Cap() int
 }
 
+// ErrIndicationPending means the previous indication on this connection has
+// not been confirmed. The caller may retry after the client confirms it.
+var ErrIndicationPending = errors.New("central has an unconfirmed indication")
+
 type notifier struct {
 	central *central
 	a       *attr
 	maxlen  int
 	done    atomic.Bool
+	ccc     uint16 // Protected by central.notifiersmu on Linux.
 }
 
 func newNotifier(c *central, a *attr, maxlen int) *notifier {
-	return &notifier{central: c, a: a, maxlen: maxlen}
+	return &notifier{central: c, a: a, maxlen: maxlen, ccc: gattCCCNotifyFlag}
 }
 
 func (n *notifier) Write(b []byte) (int, error) {
 	if n.done.Load() {
 		return 0, errors.New("central stopped notifications")
 	}
-	return n.central.sendNotification(n.a, b)
+	return n.central.sendNotification(n, b)
 }
 
 func (n *notifier) Done() bool {

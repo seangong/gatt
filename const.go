@@ -85,10 +85,13 @@ const (
 	attEcodeInsuffEnc         attEcode = 0x0f // The attribute requires encryption before it can be read or written.
 	attEcodeUnsuppGrpType     attEcode = 0x10 // The attribute type is not a supported grouping attribute as defined by a higher layer specification.
 	attEcodeInsuffResources   attEcode = 0x11 // Insufficient Resources to complete the request.
+	attEcodeValueNotAllowed   attEcode = 0x13 // The attribute parameter value was not allowed.
 )
 
 func (a attEcode) Error() string {
 	switch i := int(a); {
+	case a == attEcodeValueNotAllowed:
+		return "value not allowed"
 	case i < 0x11:
 		return attEcodeName[a]
 	case i >= 0x12 && i <= 0x7F: // Reserved for future use
