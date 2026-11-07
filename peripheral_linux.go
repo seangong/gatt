@@ -2,6 +2,7 @@ package gatt
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/seangong/gatt/v2/linux"
 )
@@ -29,8 +31,14 @@ type peripheral struct {
 	mtu uint16
 	l2c io.ReadWriteCloser
 
-	reqc  chan message
-	quitc chan struct{}
+	reqc       chan message
+	quitc      chan struct{}
+	stopOnce   sync.Once
+	abortOnce  sync.Once
+	stopErr    error // Published by closing quitc.
+	callout    func(func()) bool
+	notifyOnce sync.Once
+	notifyGate chan struct{}
 
 	pd *linux.PlatData // platform specific data
 }
@@ -41,13 +49,16 @@ func (p *peripheral) Name() string         { return p.pd.Name }
 func (p *peripheral) Services() []*Service { return p.svcs }
 
 func finish(op byte, h uint16, b []byte) bool {
+	if len(b) != 5 {
+		return false
+	}
 	done := b[0] == attOpError && b[1] == op && b[2] == byte(h) && b[3] == byte(h>>8)
 	e := attEcode(b[4])
 	if e != attEcodeAttrNotFound {
 		// log.Printf("unexpected protocol error: %s", e)
 		// FIXME: terminate the connection
 	}
-	return done
+	return done && e == attEcodeAttrNotFound
 }
 
 func (p *peripheral) DiscoverServices(s []UUID) ([]*Service, error) {
@@ -63,9 +74,13 @@ func (p *peripheral) DiscoverServices(s []UUID) ([]*Service, error) {
 		binary.LittleEndian.PutUint16(b[3:5], 0xFFFF)
 		binary.LittleEndian.PutUint16(b[5:7], 0x2800)
 
-		b = p.sendReq(op, b)
-		if finish(op, start, b) {
-			break
+		var err error
+		b, err = p.sendReq(op, b)
+		if err != nil {
+			if finish(op, start, b) {
+				break
+			}
+			return nil, err
 		}
 		b = b[1:]
 		l, b := int(b[0]), b[1:]
@@ -111,9 +126,13 @@ func (p *peripheral) DiscoverCharacteristics(cs []UUID, s *Service) ([]*Characte
 		binary.LittleEndian.PutUint16(b[3:5], s.endh)
 		binary.LittleEndian.PutUint16(b[5:7], 0x2803)
 
-		b = p.sendReq(op, b)
-		if finish(op, start, b) {
-			break
+		var err error
+		b, err = p.sendReq(op, b)
+		if err != nil {
+			if finish(op, start, b) {
+				break
+			}
+			return nil, err
 		}
 		b = b[1:]
 
@@ -172,9 +191,13 @@ func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descr
 		binary.LittleEndian.PutUint16(b[1:3], start)
 		binary.LittleEndian.PutUint16(b[3:5], c.endh)
 
-		b = p.sendReq(op, b)
-		if finish(attOpFindInfoReq, start, b) {
-			break
+		var err error
+		b, err = p.sendReq(op, b)
+		if err != nil {
+			if finish(attOpFindInfoReq, start, b) {
+				break
+			}
+			return nil, err
 		}
 		b = b[1:]
 
@@ -211,7 +234,10 @@ func (p *peripheral) ReadCharacteristic(c *Characteristic) ([]byte, error) {
 	b[0] = op
 	binary.LittleEndian.PutUint16(b[1:3], c.vh)
 
-	b = p.sendReq(op, b)
+	b, err := p.sendReq(op, b)
+	if err != nil {
+		return nil, err
+	}
 	b = b[1:]
 	return b, nil
 }
@@ -239,7 +265,10 @@ func (p *peripheral) ReadLongCharacteristic(c *Characteristic) ([]byte, error) {
 		binary.LittleEndian.PutUint16(b[1:3], c.vh)
 		binary.LittleEndian.PutUint16(b[3:5], off)
 
-		b = p.sendReq(op, b)
+		b, err = p.sendReq(op, b)
+		if err != nil {
+			return nil, err
+		}
 		b = b[1:]
 		if len(b) == 0 {
 			break
@@ -264,13 +293,10 @@ func (p *peripheral) WriteCharacteristic(c *Characteristic, value []byte, noRsp 
 	copy(b[3:], value)
 
 	if noRsp {
-		p.sendCmd(op, b)
-		return nil
+		return p.sendCmd(attOpWriteCmd, b)
 	}
-	b = p.sendReq(op, b)
-	// TODO: error handling
-	b = b[1:]
-	return nil
+	_, err := p.sendReq(op, b)
+	return err
 }
 
 func (p *peripheral) ReadDescriptor(d *Descriptor) ([]byte, error) {
@@ -279,9 +305,11 @@ func (p *peripheral) ReadDescriptor(d *Descriptor) ([]byte, error) {
 	b[0] = op
 	binary.LittleEndian.PutUint16(b[1:3], d.h)
 
-	b = p.sendReq(op, b)
+	b, err := p.sendReq(op, b)
+	if err != nil {
+		return nil, err
+	}
 	b = b[1:]
-	// TODO: error handling
 	return b, nil
 }
 
@@ -292,10 +320,8 @@ func (p *peripheral) WriteDescriptor(d *Descriptor, value []byte) error {
 	binary.LittleEndian.PutUint16(b[1:3], d.h)
 	copy(b[3:], value)
 
-	b = p.sendReq(op, b)
-	b = b[1:]
-	// TODO: error handling
-	return nil
+	_, err := p.sendReq(op, b)
+	return err
 }
 
 func (p *peripheral) setNotifyValue(c *Characteristic, flag uint16,
@@ -303,7 +329,23 @@ func (p *peripheral) setNotifyValue(c *Characteristic, flag uint16,
 	if c.cccd == nil {
 		return errors.New("no cccd") // FIXME
 	}
+	p.notifyOnce.Do(func() { p.notifyGate = make(chan struct{}, 1) })
+	if err := p.closedError(); err != nil {
+		return err
+	}
+	select {
+	case <-p.quitc:
+		return p.stopErr
+	case <-p.connectionDone():
+		return p.closedError()
+	case p.notifyGate <- struct{}{}:
+	}
+	defer func() { <-p.notifyGate }()
+	if err := p.closedError(); err != nil {
+		return err
+	}
 	ccc := uint16(0)
+	previous := p.sub.fn(c.vh)
 	if f != nil {
 		ccc = flag
 		p.sub.subscribe(c.vh, func(b []byte, err error) { f(c, b, err) })
@@ -314,9 +356,16 @@ func (p *peripheral) setNotifyValue(c *Characteristic, flag uint16,
 	binary.LittleEndian.PutUint16(b[1:3], c.cccd.h)
 	binary.LittleEndian.PutUint16(b[3:5], ccc)
 
-	b = p.sendReq(op, b)
-	b = b[1:]
-	// TODO: error handling
+	if _, err := p.sendReq(op, b); err != nil {
+		if f != nil {
+			if previous == nil {
+				p.sub.unsubscribe(c.vh)
+			} else {
+				p.sub.subscribe(c.vh, previous)
+			}
+		}
+		return err
+	}
 	if f == nil {
 		p.sub.unsubscribe(c.vh)
 	}
@@ -349,47 +398,190 @@ func searchService(ss []*Service, start, end uint16) *Service {
 
 // TODO: unifiy the message with OS X pots and refactor
 type message struct {
-	op   byte
-	b    []byte
-	rspc chan []byte
+	op    byte
+	b     []byte
+	noRsp bool
+	rspc  chan peripheralResult
 }
 
-func (p *peripheral) sendCmd(op byte, b []byte) {
-	p.reqc <- message{op: op, b: b}
+type peripheralResult struct {
+	b   []byte
+	err error
 }
 
-func (p *peripheral) sendReq(op byte, b []byte) []byte {
-	m := message{op: op, b: b, rspc: make(chan []byte)}
-	p.reqc <- m
-	return <-m.rspc
+func (p *peripheral) connectionDone() <-chan struct{} {
+	if c, ok := p.l2c.(interface{ Context() context.Context }); ok {
+		return c.Context().Done()
+	}
+	return nil
+}
+
+func (p *peripheral) stop(err error) {
+	if err == nil {
+		err = io.ErrClosedPipe
+	}
+	p.stopOnce.Do(func() {
+		p.stopErr = err
+		close(p.quitc)
+	})
+}
+
+func (p *peripheral) abort(err error) {
+	p.stop(err)
+	p.abortOnce.Do(func() {
+		if c, ok := p.l2c.(interface{ Abort(error) }); ok {
+			c.Abort(err)
+			return
+		}
+		if closeErr := p.l2c.Close(); closeErr != nil {
+			log.Printf("peripheral: close connection after %v: %v", err, closeErr)
+		}
+	})
+}
+
+func (p *peripheral) closedError() error {
+	select {
+	case <-p.quitc:
+		return p.stopErr
+	default:
+	}
+	select {
+	case <-p.connectionDone():
+		return io.ErrClosedPipe
+	default:
+		return nil
+	}
+}
+
+func (p *peripheral) sendCmd(op byte, b []byte) error {
+	_, err := p.send(op, b, true)
+	return err
+}
+
+func (p *peripheral) sendReq(op byte, b []byte) ([]byte, error) {
+	return p.send(op, b, false)
+}
+
+func (p *peripheral) send(op byte, b []byte, noRsp bool) ([]byte, error) {
+	if p.l2c == nil || p.reqc == nil || p.quitc == nil {
+		return nil, io.ErrClosedPipe
+	}
+	if err := p.closedError(); err != nil {
+		return nil, err
+	}
+	m := message{op: op, b: b, noRsp: noRsp, rspc: make(chan peripheralResult, 1)}
+	done := p.connectionDone()
+	select {
+	case <-p.quitc:
+		return nil, p.stopErr
+	case <-done:
+		return nil, p.closedError()
+	case p.reqc <- m:
+	}
+	select {
+	case <-p.quitc:
+		return nil, p.stopErr
+	case <-done:
+		return nil, p.closedError()
+	case result := <-m.rspc:
+		return result.b, result.err
+	}
+}
+
+func (p *peripheral) requestLoop(rspc <-chan []byte) {
+	done := p.connectionDone()
+	for {
+		var req message
+		select {
+		case <-p.quitc:
+			return
+		case <-done:
+			p.stop(io.ErrClosedPipe)
+			return
+		case req = <-p.reqc:
+		}
+		if err := p.closedError(); err != nil {
+			return
+		}
+		n, err := p.l2c.Write(req.b)
+		if err == nil && n != len(req.b) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			p.abort(fmt.Errorf("write ATT operation 0x%02x: %w", req.op, err))
+			return
+		}
+		result := peripheralResult{}
+		if !req.noRsp {
+			select {
+			case <-p.quitc:
+				return
+			case <-done:
+				p.stop(io.ErrClosedPipe)
+				return
+			case result.b = <-rspc:
+			}
+			if err := validPeripheralResponse(req.op, result.b); err != nil {
+				p.abort(err)
+				return
+			}
+			if result.b[0] == attOpError {
+				handle := binary.LittleEndian.Uint16(result.b[2:4])
+				result.err = fmt.Errorf("ATT operation 0x%02x at handle 0x%04x: %w", req.op, handle, attEcode(result.b[4]))
+			}
+		}
+		select {
+		case <-p.quitc:
+			return
+		case <-done:
+			p.stop(io.ErrClosedPipe)
+			return
+		case req.rspc <- result:
+		}
+	}
+}
+
+func validPeripheralResponse(op byte, b []byte) error {
+	if len(b) == 0 {
+		return ErrInvalidLength
+	}
+	if b[0] == attOpError {
+		if len(b) != 5 {
+			return ErrInvalidLength
+		}
+		if b[1] == op {
+			return nil
+		}
+	} else if b[0] == attRspFor[op] {
+		switch op {
+		case attOpMtuReq:
+			if len(b) != 3 {
+				return ErrInvalidLength
+			}
+		case attOpFindInfoReq, attOpReadByTypeReq, attOpReadByGroupReq:
+			if len(b) < 2 {
+				return ErrInvalidLength
+			}
+		case attOpWriteReq:
+			if len(b) != 1 {
+				return ErrInvalidLength
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("ATT operation 0x%02x received mismatched response 0x%02x", op, b[0])
 }
 
 func (p *peripheral) loop() {
-	// Serialize the request.
 	rspc := make(chan []byte)
-
-	// Dequeue request loop
+	pumpDone := make(chan struct{})
 	go func() {
-		for {
-			select {
-			case req := <-p.reqc:
-				p.l2c.Write(req.b)
-				if req.rspc == nil {
-					break
-				}
-				r := <-rspc
-				switch reqOp, rspOp := req.b[0], r[0]; {
-				case rspOp == attRspFor[reqOp]:
-				case rspOp == attOpError && r[1] == reqOp:
-				default:
-					log.Printf("Request 0x%02x got a mismatched response: 0x%02x", reqOp, rspOp)
-					// FIXME: terminate the connection?
-				}
-				req.rspc <- r
-			case <-p.quitc:
-				return
-			}
-		}
+		defer close(pumpDone)
+		p.requestLoop(rspc)
+	}()
+	defer func() {
+		p.stop(io.EOF)
+		<-pumpDone
 	}()
 
 	// L2CAP implementations shall support a minimum MTU size of 48 bytes.
@@ -398,9 +590,17 @@ func (p *peripheral) loop() {
 
 	// Handling response or notification/indication
 	for {
+		if err := p.closedError(); err != nil {
+			return
+		}
 		n, err := p.l2c.Read(buf)
 		if n == 0 || err != nil {
-			close(p.quitc)
+			if err == nil {
+				err = io.EOF
+			}
+			if p.closedError() == nil {
+				p.abort(err)
+			}
 			return
 		}
 
@@ -408,22 +608,47 @@ func (p *peripheral) loop() {
 		copy(b, buf)
 
 		if (b[0] != attOpHandleNotify) && (b[0] != attOpHandleInd) {
-			rspc <- b
+			select {
+			case <-p.quitc:
+				return
+			case <-p.connectionDone():
+				return
+			case rspc <- b:
+			}
 			continue
 		}
 
+		if len(b) < 3 {
+			p.abort(ErrInvalidLength)
+			return
+		}
 		h := binary.LittleEndian.Uint16(b[1:3])
 		f := p.sub.fn(h)
 		if f == nil {
 			log.Printf("notified by unsubscribed handle")
 			// FIXME: terminate the connection?
 		} else {
-			go f(b[3:], nil)
+			callback := func() { f(b[3:], nil) }
+			if p.callout != nil {
+				if !p.callout(callback) {
+					p.abort(errors.New("peripheral notification callback capacity exceeded"))
+					return
+				}
+			} else {
+				go callback()
+			}
 		}
 
 		if b[0] == attOpHandleInd {
 			// write aknowledgement for indication
-			p.l2c.Write([]byte{attOpHandleCnf})
+			n, err := p.l2c.Write([]byte{attOpHandleCnf})
+			if err == nil && n != 1 {
+				err = io.ErrShortWrite
+			}
+			if err != nil {
+				p.abort(fmt.Errorf("write ATT indication confirmation: %w", err))
+				return
+			}
 		}
 
 	}
@@ -435,7 +660,10 @@ func (p *peripheral) SetMTU(mtu uint16) error {
 	b[0] = op
 	binary.LittleEndian.PutUint16(b[1:3], uint16(mtu))
 
-	b = p.sendReq(op, b)
+	b, err := p.sendReq(op, b)
+	if err != nil {
+		return err
+	}
 	serverMTU := binary.LittleEndian.Uint16(b[1:3])
 	if serverMTU < mtu {
 		mtu = serverMTU

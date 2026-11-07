@@ -31,6 +31,11 @@ func (d *flowTestDevice) Read(b []byte) (int, error) {
 }
 
 func (d *flowTestDevice) Write(b []byte) (int, error) {
+	select {
+	case <-d.done:
+		return 0, io.ErrClosedPipe
+	default:
+	}
 	d.mu.Lock()
 	d.writes = append(d.writes, append([]byte(nil), b...))
 	d.mu.Unlock()
@@ -142,6 +147,7 @@ func TestHCIReceivesCommandsWhileWritingLargeResponse(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Error("HCI main loop did not exit")
 		}
+		h.Close()
 	}()
 	select {
 	case err := <-result:

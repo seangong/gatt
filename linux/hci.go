@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -15,6 +16,9 @@ import (
 )
 
 const hciCloseTimeout = 5 * time.Second
+
+// Leave time to interrupt IO and join the local workers after graceful shutdown.
+const hciGraceTimeout = hciCloseTimeout - time.Second
 
 type HCI struct {
 	AcceptMasterHandler  func(pd *PlatData)
@@ -36,8 +40,22 @@ type HCI struct {
 	conns   map[uint16]*conn
 	closed  bool // Protected by connsmu.
 
-	closeOnce sync.Once
-	closeErr  error
+	closeOnce       sync.Once
+	closeDone       chan struct{}
+	abort           chan struct{}
+	changed         chan struct{}
+	readerDone      chan struct{}
+	readerStarted   bool
+	transportClosed bool
+	transportOnce   sync.Once
+	transportErr    error
+	closeCause      error
+	closeErr        error
+	workers         sync.WaitGroup
+	callbacks       chan struct{}
+	scanning        bool
+	connecting      bool
+	pendingSource   *PlatData // Original Connect argument, protected by connsmu.
 
 	adv   bool
 	advmu *sync.Mutex
@@ -88,45 +106,227 @@ func NewHCI(devID int, chk bool, maxConn int) (*HCI, error) {
 	e.HandleEvent(evt.CommandComplete, evt.HandlerFunc(c.HandleComplete))
 	e.HandleEvent(evt.CommandStatus, evt.HandlerFunc(c.HandleStatus))
 
+	ctx, cancel := context.WithTimeout(context.Background(), hciCloseTimeout)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	if err := d.SetDeadline(deadline); err != nil {
+		h.requestClose(err)
+		return nil, h.Close()
+	}
 	go h.mainLoop()
-	h.resetDevice()
+	if err := h.resetDevice(ctx); err != nil {
+		h.requestClose(err)
+		return nil, h.Close()
+	}
+	if err := ctx.Err(); err != nil {
+		h.requestClose(err)
+		return nil, h.Close()
+	}
+	if err := d.SetDeadline(time.Time{}); err != nil {
+		h.requestClose(err)
+		return nil, h.Close()
+	}
+	h.connsmu.Lock()
+	closed := h.closed
+	h.connsmu.Unlock()
+	if closed {
+		return nil, h.Close()
+	}
 	return h, nil
 }
 
+// initLifecycle is called with connsmu held. Tests can construct an HCI directly.
+func (h *HCI) initLifecycle() {
+	if h.advmu == nil {
+		h.advmu = &sync.Mutex{}
+	}
+	if h.closeDone == nil {
+		h.closeDone = make(chan struct{})
+		h.abort = make(chan struct{})
+		h.changed = make(chan struct{}, 1)
+		h.readerDone = make(chan struct{})
+		h.callbacks = make(chan struct{}, max(1, h.maxConn))
+	}
+}
+
+// requestClose never waits: a worker can report failure without joining itself.
+func (h *HCI) requestClose(cause error) <-chan struct{} {
+	h.connsmu.Lock()
+	h.initLifecycle()
+	if cause != nil && !h.transportClosed && h.closeCause == nil {
+		h.closeCause = cause
+		close(h.abort)
+	}
+	h.closed = true
+	h.c.BeginShutdown()
+	for _, c := range h.conns {
+		c.stop()
+	}
+	done := h.closeDone
+	h.closeOnce.Do(func() { go h.shutdown() })
+	h.connsmu.Unlock()
+	return done
+}
+
 func (h *HCI) Close() error {
-	h.closeOnce.Do(func() {
+	<-h.requestClose(nil)
+	return h.closeErr
+}
+
+func (h *HCI) shutdown() {
+	ctx, cancel := context.WithTimeout(context.Background(), hciGraceTimeout)
+	defer cancel()
+	select {
+	case <-h.abort:
+		cancel()
+	default:
+	}
+	// Cancel response waits when the receiver fails, including during shutdown.
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-h.abort:
+			cancel()
+		case <-ctx.Done():
+		}
+		h.closeTransport()
+	}()
+	if d, ok := h.d.(interface{ SetDeadline(time.Time) error }); ok {
+		deadline, _ := ctx.Deadline()
+		if err := d.SetDeadline(deadline); err != nil {
+			h.requestClose(fmt.Errorf("hci: set shutdown deadline: %w", err))
+			cancel()
+		}
+	}
+	err := h.disconnectAll(ctx)
+	if ctx.Err() != nil && err != nil {
+		err = ctx.Err()
+	}
+	cancel()
+	<-watchDone
+	h.closeTransport()
+	h.connsmu.Lock()
+	started, readerDone := h.readerStarted, h.readerDone
+	h.connsmu.Unlock()
+	h.c.Wait()
+	h.workers.Wait()
+	if started {
+		<-readerDone
+	}
+	h.connsmu.Lock()
+	cause := h.closeCause
+	h.connsmu.Unlock()
+	if cause != nil && errors.Is(err, context.Canceled) {
+		err = nil
+	}
+	h.closeErr = errors.Join(cause, err, h.transportErr)
+	// The poller's IO deadline can win the race with the context timer.
+	if errors.Is(h.closeErr, os.ErrDeadlineExceeded) && !errors.Is(h.closeErr, context.DeadlineExceeded) {
+		h.closeErr = errors.Join(context.DeadlineExceeded, h.closeErr)
+	}
+	close(h.closeDone)
+}
+
+// closeTransport is independent of the graceful sender: closing the pollable
+// socket must be able to interrupt that sender's own Write as well.
+func (h *HCI) closeTransport() {
+	h.transportOnce.Do(func() {
+		h.c.Close()
 		h.connsmu.Lock()
-		h.closed = true
-		connections := make([]*conn, 0, len(h.conns))
-		for _, c := range h.conns {
-			c.stop()
-			connections = append(connections, c)
+		h.transportClosed = true
+		h.connecting = false
+		h.pendingSource = nil
+		for handle, c := range h.conns {
+			c.terminate(io.ErrClosedPipe)
+			delete(h.conns, handle)
 		}
 		h.connsmu.Unlock()
-		// Disconnect shares the command queue with other HCI operations. Bound
-		// the total wait so an unresponsive command cannot prevent shutdown.
-		timeoutDone := make(chan struct{})
-		timer := time.AfterFunc(hciCloseTimeout, func() {
-			h.c.Close()
-			close(timeoutDone)
-		})
-		for _, c := range connections {
-			c.Close()
-		}
-		timedOut := !timer.Stop()
-		if timedOut {
-			<-timeoutDone
-		}
-		h.c.Close()
-		h.closeErr = h.d.Close()
-		if timedOut {
-			h.closeErr = errors.Join(
-				fmt.Errorf("hci: timed out waiting for connections to close: %w", context.DeadlineExceeded),
-				h.closeErr,
-			)
-		}
+		h.transportErr = h.d.Close()
 	})
-	return h.closeErr
+}
+
+func (h *HCI) disconnectAll(ctx context.Context) error {
+	h.connsmu.Lock()
+	scanning, connecting := h.scanning, h.connecting
+	h.connsmu.Unlock()
+	h.advmu.Lock()
+	advertising := h.adv
+	h.adv = false
+	h.advmu.Unlock()
+	var commands []cmd.CmdParam
+	if scanning {
+		commands = append(commands, cmd.LESetScanEnable{})
+	}
+	if advertising {
+		commands = append(commands, cmd.LESetAdvertiseEnable{})
+	}
+	if connecting {
+		commands = append(commands, cmd.LECreateConnCancel{})
+	}
+	for _, cp := range commands {
+		response, err := h.c.SendShutdownContext(ctx, cp)
+		if err != nil {
+			return err
+		}
+		if len(response) == 0 || response[0] != 0 {
+			return fmt.Errorf("hci: shutdown command 0x%04X returned status [% X]", cp.Opcode(), response)
+		}
+	}
+	for {
+		h.connsmu.Lock()
+		connections := make([]*conn, 0, len(h.conns))
+		for _, c := range h.conns {
+			connections = append(connections, c)
+		}
+		pendingConnection := h.connecting
+		h.connsmu.Unlock()
+		if len(connections) == 0 && !pendingConnection {
+			return nil
+		}
+		for _, c := range connections {
+			if err := c.disconnect(ctx); err != nil {
+				return err
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-h.changed:
+		}
+	}
+}
+
+func (h *HCI) startWorker(f func()) bool {
+	h.connsmu.Lock()
+	if h.closed {
+		h.connsmu.Unlock()
+		return false
+	}
+	h.workers.Add(1)
+	h.connsmu.Unlock()
+	go func() { defer h.workers.Done(); f() }()
+	return true
+}
+
+// Callouts run outside the core workers so a callback may call Close. Slots are
+// held until the user function actually returns, including after cancellation.
+func (h *HCI) callout(f func()) bool {
+	h.connsmu.Lock()
+	h.initLifecycle()
+	if h.closed {
+		h.connsmu.Unlock()
+		return false
+	}
+	select {
+	case h.callbacks <- struct{}{}:
+		h.connsmu.Unlock()
+		go func() { defer func() { <-h.callbacks }(); f() }()
+		return true
+	default:
+		h.connsmu.Unlock()
+		return false
+	}
 }
 
 func (h *HCI) SetAdvertiseEnable(en bool) error {
@@ -144,35 +344,61 @@ func (h *HCI) setAdvertiseEnable(en bool) error {
 		return io.ErrClosedPipe
 	}
 	h.advmu.Lock()
-	defer h.advmu.Unlock()
-	if en && h.adv && (connectionCount == h.maxConn) {
+	full := en && h.adv && connectionCount == h.maxConn
+	h.advmu.Unlock()
+	if full {
 		return nil
 	}
-	return h.c.SendAndCheckResp(
-		cmd.LESetAdvertiseEnable{
-			AdvertisingEnable: btoi(en),
-		}, []byte{0x00})
+	return h.c.SendAndCheckResp(cmd.LESetAdvertiseEnable{AdvertisingEnable: btoi(en)}, []byte{0})
 }
 
-func (h *HCI) SendCmdWithAdvOff(c cmd.CmdParam) error {
-	h.setAdvertiseEnable(false)
-	err := h.c.SendAndCheckResp(c, nil)
-	if h.adv {
-		h.setAdvertiseEnable(true)
+func (h *HCI) SendCmdWithAdvOff(cp cmd.CmdParam) error {
+	if err := h.setAdvertiseEnable(false); err != nil {
+		return err
+	}
+	err := h.c.SendAndCheckResp(cp, nil)
+	h.advmu.Lock()
+	advertising := h.adv
+	h.advmu.Unlock()
+	if advertising {
+		err = errors.Join(err, h.setAdvertiseEnable(true))
 	}
 	return err
 }
 
 func (h *HCI) SetScanEnable(en bool, dup bool) error {
-	return h.c.SendAndCheckResp(
-		cmd.LESetScanEnable{
-			LEScanEnable:     btoi(en),
-			FilterDuplicates: btoi(!dup),
-		}, []byte{0x00})
+	h.connsmu.Lock()
+	if h.closed {
+		h.connsmu.Unlock()
+		return io.ErrClosedPipe
+	}
+	h.scanning = en
+	h.connsmu.Unlock()
+	return h.c.SendAndCheckResp(cmd.LESetScanEnable{
+		LEScanEnable: btoi(en), FilterDuplicates: btoi(!dup),
+	}, []byte{0})
 }
 
 func (h *HCI) Connect(pd *PlatData) error {
-	h.c.Send(
+	h.connsmu.Lock()
+	if h.closed {
+		h.connsmu.Unlock()
+		return io.ErrClosedPipe
+	}
+	if h.connecting {
+		h.connsmu.Unlock()
+		return errors.New("hci: connection attempt already pending")
+	}
+	h.connecting = true
+	h.pendingSource = pd
+	h.connsmu.Unlock()
+	// Keep the caller's parsed name without sharing mutable advertisement data.
+	report := *pd
+	report.Data = append([]byte(nil), pd.Data...)
+	h.plistmu.Lock()
+	h.plist[pd.Address] = &report
+	h.plistmu.Unlock()
+	_, err := h.c.Send(
 		cmd.LECreateConn{
 			LEScanInterval:        0x0004,         // N x 0.625ms
 			LEScanWindow:          0x0004,         // N x 0.625ms
@@ -187,11 +413,36 @@ func (h *HCI) Connect(pd *PlatData) error {
 			MinimumCELength:       0x0000,         // N x 0.625ms
 			MaximumCELength:       0x0000,         // N x 0.625ms
 		})
-	return nil
+	if err != nil {
+		h.connsmu.Lock()
+		if h.pendingSource == pd {
+			h.connecting = false
+			h.pendingSource = nil
+		}
+		h.initLifecycle()
+		select {
+		case h.changed <- struct{}{}:
+		default:
+		}
+		h.connsmu.Unlock()
+	}
+	return err
 }
 
 func (h *HCI) CancelConnection(pd *PlatData) error {
-	return pd.Conn.Close()
+	h.connsmu.Lock()
+	target := pd.Conn
+	for _, c := range h.conns {
+		if c.origin == pd {
+			target = c
+			break
+		}
+	}
+	h.connsmu.Unlock()
+	if target == nil {
+		return nil
+	}
+	return target.Close()
 }
 
 func (h *HCI) SendRawCommand(c cmd.CmdParam) ([]byte, error) {
@@ -206,36 +457,47 @@ func btoi(b bool) uint8 {
 }
 
 func (h *HCI) mainLoop() {
-	defer func() {
-		h.c.Close()
-		h.connsmu.Lock()
-		defer h.connsmu.Unlock()
-		h.closed = true
-		for handle, c := range h.conns {
-			c.stop()
-			delete(h.conns, handle)
-		}
-	}()
+	h.connsmu.Lock()
+	h.initLifecycle()
+	if h.closed {
+		h.connsmu.Unlock()
+		return
+	}
+	h.readerStarted = true
+	h.connsmu.Unlock()
+	defer close(h.readerDone)
 	b := make([]byte, 4096)
 	for {
 		n, err := h.d.Read(b)
-		if err != nil {
+		if err != nil || n == 0 {
+			h.connsmu.Lock()
+			closed := h.transportClosed
+			h.connsmu.Unlock()
+			if !closed {
+				if err == nil {
+					err = io.EOF
+				}
+				h.requestClose(fmt.Errorf("hci: read: %w", err))
+			}
 			return
 		}
-		if n == 0 {
-			return
-		}
-		p := make([]byte, n)
-		copy(p, b)
+		p := append([]byte(nil), b[:n]...)
 		h.handlePacket(p)
 	}
 }
 
 func (h *HCI) handlePacket(b []byte) {
+	if len(b) == 0 {
+		return
+	}
 	t, b := packetType(b[0]), b[1:]
 	var err error
 	switch t {
 	case typCommandPkt:
+		if len(b) < 2 {
+			h.requestClose(errors.New("hci: malformed command packet"))
+			return
+		}
 		op := uint16(b[0]) | uint16(b[1])<<8
 		log.Printf("unmanaged cmd: opcode (%04x) [ % X ]\n", op, b)
 	case typACLDataPkt:
@@ -243,23 +505,18 @@ func (h *HCI) handlePacket(b []byte) {
 	case typSCODataPkt:
 		err = fmt.Errorf("SCO packet not supported")
 	case typEventPkt:
-		go func() {
-			err := h.e.Dispatch(b)
-			if err != nil {
-				log.Printf("hci: %s, [ % X]", err, b)
-			}
-		}()
+		err = h.e.Dispatch(b)
 	case typVendorPkt:
 		err = fmt.Errorf("Vendor packet not supported")
 	default:
-		log.Fatalf("Unknown event: 0x%02X [ % X ]\n", t, b)
+		h.requestClose(fmt.Errorf("Unknown event: 0x%02X [ % X ]", t, b))
 	}
 	if err != nil {
 		log.Printf("hci: %s, [ % X]", err, b)
 	}
 }
 
-func (h *HCI) resetDevice() error {
+func (h *HCI) resetDevice(ctx context.Context) error {
 	seq := []cmd.CmdParam{
 		cmd.Reset{},
 		cmd.SetEventMask{EventMask: 0x3dbff807fffbffff},
@@ -286,7 +543,7 @@ func (h *HCI) resetDevice() error {
 		},
 	}
 	for _, s := range seq {
-		if err := h.c.SendAndCheckResp(s, []byte{0x00}); err != nil {
+		if err := h.c.SendAndCheckRespContext(ctx, s, []byte{0x00}); err != nil {
 			return err
 		}
 	}
@@ -311,10 +568,15 @@ func (h *HCI) handleAdvertisement(b []byte) {
 		if et == scanRsp {
 			h.plistmu.Lock()
 			pd, ok := h.plist[addr]
-			h.plistmu.Unlock()
+			var report PlatData
 			if ok {
 				pd.Data = append(pd.Data, ep.Data[i]...)
-				h.AdvertisementHandler(pd)
+				report = *pd
+				report.Data = append([]byte(nil), pd.Data...)
+			}
+			h.plistmu.Unlock()
+			if ok {
+				h.callout(func() { h.AdvertisementHandler(&report) })
 			}
 			continue
 		}
@@ -332,7 +594,9 @@ func (h *HCI) handleAdvertisement(b []byte) {
 		if scannable {
 			continue
 		}
-		h.AdvertisementHandler(pd)
+		report := *pd
+		report.Data = append([]byte(nil), pd.Data...)
+		h.callout(func() { h.AdvertisementHandler(&report) })
 	}
 }
 
@@ -343,7 +607,11 @@ func (h *HCI) handleNumberOfCompletedPkts(b []byte) error {
 	}
 	for _, r := range ep.Packets {
 		for i := 0; i < int(r.NumOfCompletedPkts); i++ {
-			<-h.bufCnt
+			select {
+			case <-h.bufCnt:
+			default:
+				return fmt.Errorf("hci: completion exceeds outstanding ACL packets")
+			}
 		}
 	}
 	return nil
@@ -352,40 +620,77 @@ func (h *HCI) handleNumberOfCompletedPkts(b []byte) error {
 func (h *HCI) handleConnection(b []byte) {
 	ep := &evt.LEConnectionCompleteEP{}
 	if err := ep.Unmarshal(b); err != nil {
-		return // FIXME
+		return
 	}
-	hh := ep.ConnectionHandle
-	c := newConn(h, hh)
 	h.connsmu.Lock()
-	if h.closed {
-		c.stop()
+	h.initLifecycle()
+	var origin *PlatData
+	if ep.Status != 0 {
+		h.connecting = false
+		h.pendingSource = nil
+	} else if ep.Role == 0x00 && (h.pendingSource == nil ||
+		h.pendingSource.Address == ep.PeerAddress && h.pendingSource.AddressType == ep.PeerAddressType) {
+		origin = h.pendingSource
+		h.connecting = false
+		h.pendingSource = nil
+	}
+	if ep.Status != 0 || h.transportClosed || h.closeCause != nil {
+		select {
+		case h.changed <- struct{}{}:
+		default:
+		}
 		h.connsmu.Unlock()
 		return
 	}
-	h.conns[hh] = c
-	h.connsmu.Unlock()
-	h.setAdvertiseEnable(true)
-
-	// FIXME: sloppiness. This call should be called by the package user once we
-	// flesh out the support of l2cap signaling packets (CID:0x0001,0x0005)
-	if ep.ConnLatency != 0 || ep.ConnInterval > 0x18 {
-		c.updateConnection()
+	c := newConn(h, ep.ConnectionHandle)
+	c.origin = origin
+	if previous := h.conns[c.attr]; previous != nil {
+		previous.terminate(io.ErrClosedPipe)
 	}
-
-	// master connection
-	if ep.Role == 0x01 {
-		pd := &PlatData{
-			Address: ep.PeerAddress,
-			Conn:    c,
-		}
-		h.AcceptMasterHandler(pd)
+	h.conns[c.attr] = c
+	closing := h.closed
+	if closing {
+		c.stop()
+	}
+	select {
+	case h.changed <- struct{}{}:
+	default:
+	}
+	h.connsmu.Unlock()
+	if closing {
 		return
 	}
-	h.plistmu.Lock()
-	pd := h.plist[ep.PeerAddress]
-	h.plistmu.Unlock()
-	pd.Conn = c
-	h.AcceptSlaveHandler(pd)
+	h.startWorker(func() {
+		if err := h.setAdvertiseEnable(true); err != nil {
+			c.Abort(err)
+			return
+		}
+		// FIXME: sloppiness. This call should be called by the package user once we
+		// flesh out the support of l2cap signaling packets (CID:0x0001,0x0005)
+		if ep.ConnLatency != 0 || ep.ConnInterval > 0x18 {
+			if _, err := c.updateConnection(); err != nil {
+				c.Abort(err)
+				return
+			}
+		}
+		pd := &PlatData{Address: ep.PeerAddress, Conn: c}
+		// master connection
+		if ep.Role == 0x01 {
+			if h.AcceptMasterHandler != nil && !h.callout(func() { h.AcceptMasterHandler(pd) }) {
+				c.Abort(errors.New("connection callback capacity exhausted"))
+			}
+			return
+		}
+		h.plistmu.Lock()
+		if advertised := h.plist[ep.PeerAddress]; advertised != nil {
+			*pd = *advertised
+			pd.Conn = c
+		}
+		h.plistmu.Unlock()
+		if h.AcceptSlaveHandler != nil && !h.callout(func() { h.AcceptSlaveHandler(pd) }) {
+			c.Abort(errors.New("connection callback capacity exhausted"))
+		}
+	})
 }
 
 func (h *HCI) handleDisconnectionComplete(b []byte) error {
@@ -393,31 +698,42 @@ func (h *HCI) handleDisconnectionComplete(b []byte) error {
 	if err := ep.Unmarshal(b); err != nil {
 		return err
 	}
-	hh := ep.ConnectionHandle
-	h.connsmu.Lock()
-	c, found := h.conns[hh]
-	if !found {
-		h.connsmu.Unlock()
-		// should not happen, just be cautious for now.
-		log.Printf("l2conn: disconnecting a disconnected 0x%04X connection", hh)
-		return nil
+	if ep.Status != 0 {
+		err := fmt.Errorf("hci: disconnect handle 0x%04x: status 0x%02x", ep.ConnectionHandle, ep.Status)
+		h.requestClose(err)
+		return err
 	}
-	delete(h.conns, hh)
-	c.stop()
+	h.connsmu.Lock()
+	if c := h.conns[ep.ConnectionHandle]; c != nil {
+		delete(h.conns, ep.ConnectionHandle)
+		c.terminate(nil)
+	}
+	h.initLifecycle()
+	select {
+	case h.changed <- struct{}{}:
+	default:
+	}
 	h.connsmu.Unlock()
-	h.setAdvertiseEnable(true)
+	h.startWorker(func() {
+		if err := h.setAdvertiseEnable(true); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			log.Printf("hci: re-enable advertising: %v", err)
+		}
+	})
 	return nil
 }
 
 func (h *HCI) handleLEMeta(b []byte) error {
+	if len(b) == 0 {
+		return errors.New("hci: empty LE event")
+	}
 	code := evt.LEEventCode(b[0])
 	switch code {
 	case evt.LEConnectionComplete:
-		go h.handleConnection(b)
+		h.handleConnection(b)
 	case evt.LEConnectionUpdateComplete:
 		// anything to do here?
 	case evt.LEAdvertisingReport:
-		go h.handleAdvertisement(b)
+		h.handleAdvertisement(b)
 	// case evt.LEReadRemoteUsedFeaturesComplete:
 	// case evt.LELTKRequest:
 	// case evt.LERemoteConnectionParameterRequest:
@@ -478,11 +794,16 @@ func (h *HCI) handleL2CAP(b []byte) error {
 		return nil
 	default:
 		c.stop()
-		go func() {
-			if err := c.Close(); err != nil {
-				log.Printf("l2conn: receive queue overflow cleanup: %v", err)
-			}
-		}()
+		// connsmu is held here; register the worker before releasing it.
+		if !h.closed {
+			h.workers.Add(1)
+			go func() {
+				defer h.workers.Done()
+				if err := c.Close(); err != nil {
+					log.Printf("l2conn: receive queue overflow cleanup: %v", err)
+				}
+			}()
+		}
 		return fmt.Errorf("l2conn: receive queue full for handle 0x%04X, disconnecting", a.attr)
 	}
 }

@@ -58,6 +58,49 @@ import "github.com/seangong/gatt/v2"
 
 Please see [pkg.go.dev](https://pkg.go.dev/github.com/seangong/gatt/v2) for documentation.
 
+### Final shutdown on Linux
+
+Linux devices provide the optional `StopContext(context.Context) error` and
+`Stop() error` methods. The `Device` interface is unchanged, so callers can use
+a capability assertion. `StopContext` is not available in v2.0.0; consumers
+pinned to that version need a release containing these changes to use it:
+
+```go
+if stopper, ok := d.(interface {
+    StopContext(context.Context) error
+}); ok {
+    if err := stopper.StopContext(ctx); err != nil {
+        log.Printf("Bluetooth shutdown: %v", err)
+    }
+}
+```
+
+Final shutdown rejects new operations, cancels connection IO, and gives all
+connections one shared graceful deadline. A successful Disconnect command is
+not enough: shutdown waits for `DisconnectionComplete`. After the graceful
+deadline, or a transport failure, it closes the command processor and the
+pollable HCI socket, then joins the library's receiver and protocol workers.
+The graceful phase currently has a four-second budget, leaving room within the
+five-second shutdown policy for local cleanup. Forced shutdown reports
+`context.DeadlineExceeded`; underlying errors remain available through
+`errors.Is`. The HCI socket must support runtime polling and IO deadlines.
+
+Concurrent shutdown callers share the same cleanup and result. Canceling the
+context passed to `StopContext` stops only that caller's wait; cleanup continues.
+Stopping advertising or removing services alone does not release the device.
+Initialization is allowed once per device. Final shutdown is irreversible;
+construct a new device to start again.
+
+Application callbacks are outside the core shutdown wait. `Request.Context()`
+is canceled on connection shutdown so read, write, and notification handlers
+can stop blocking work cooperatively. Callbacks that ignore cancellation may
+continue after shutdown returns; the library bounds their concurrency and keeps
+their slots occupied until they actually return. Lifecycle callbacks remain
+ordered per connection. Server `CentralConnected` finishes before ATT requests
+start; client `PeripheralConnected` can make synchronous discovery requests.
+`Disconnected` and `PoweredOff` callbacks may run after shutdown returns, and
+can themselves request shutdown without waiting on their own execution.
+
 ## Examples
 
 ### Build and run the examples on a native environment (Linux or OS X)

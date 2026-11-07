@@ -1,6 +1,7 @@
 package gatt
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -16,25 +17,40 @@ const (
 )
 
 type central struct {
-	attrs       *attrRange
-	mtu         uint16
-	mtuMu       sync.RWMutex
-	addr        net.HardwareAddr
-	security    security
-	l2conn      io.ReadWriteCloser
-	notifiers   map[uint16]*notifier
-	notifiersmu *sync.Mutex
+	attrs         *attrRange
+	mtu           uint16
+	mtuMu         sync.RWMutex
+	addr          net.HardwareAddr
+	security      security
+	l2conn        io.ReadWriteCloser
+	ctx           context.Context
+	cancel        context.CancelFunc
+	handlerBusy   chan struct{}
+	requestSlots  chan struct{}
+	callbackSlots chan struct{}
+	notifiers     map[uint16]*notifier
+	notifiersmu   *sync.Mutex
 }
 
 func newCentral(a *attrRange, addr net.HardwareAddr, l2conn io.ReadWriteCloser) *central {
+	ctx := context.Background()
+	if conn, ok := l2conn.(interface{ Context() context.Context }); ok {
+		ctx = conn.Context()
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	return &central{
-		attrs:       a,
-		mtu:         23,
-		addr:        addr,
-		security:    securityLow,
-		l2conn:      l2conn,
-		notifiers:   make(map[uint16]*notifier),
-		notifiersmu: &sync.Mutex{},
+		attrs:         a,
+		mtu:           23,
+		addr:          addr,
+		security:      securityLow,
+		l2conn:        l2conn,
+		ctx:           ctx,
+		cancel:        cancel,
+		handlerBusy:   make(chan struct{}, 1),
+		requestSlots:  make(chan struct{}, 1),
+		callbackSlots: make(chan struct{}, 16),
+		notifiers:     make(map[uint16]*notifier),
+		notifiersmu:   &sync.Mutex{},
 	}
 }
 
@@ -43,12 +59,60 @@ func (c *central) ID() string {
 }
 
 func (c *central) Close() error {
+	c.cancel()
 	c.notifiersmu.Lock()
-	defer c.notifiersmu.Unlock()
 	for _, n := range c.notifiers {
 		n.stop()
 	}
+	c.notifiersmu.Unlock()
 	return c.l2conn.Close()
+}
+
+func (c *central) Context() context.Context { return c.ctx }
+
+// A canceled handler retains its slot until it actually returns. This bounds
+// application code that ignores cancellation across disconnected centrals.
+func (c *central) callHandler(f func()) bool {
+	if c.ctx.Err() != nil {
+		return false
+	}
+	select {
+	case c.handlerBusy <- struct{}{}:
+	default:
+		return false
+	}
+	select {
+	case c.requestSlots <- struct{}{}:
+	default:
+		<-c.handlerBusy
+		return false
+	}
+	done := make(chan struct{})
+	go func() {
+		f()
+		<-c.requestSlots
+		<-c.handlerBusy
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-c.ctx.Done():
+		return false
+	}
+}
+
+func startCallout(slots chan struct{}, f func()) bool {
+	select {
+	case slots <- struct{}{}:
+	default:
+		return false
+	}
+	go func() {
+		defer func() { <-slots }()
+		f()
+	}()
+	return true
 }
 
 func (c *central) MTU() int {
@@ -67,12 +131,19 @@ func (c *central) loop() {
 		// The default value is 672 bytes
 		b := make([]byte, 672)
 		n, err := c.l2conn.Read(b)
-		if n == 0 || err != nil {
+		if n == 0 || err != nil || c.ctx.Err() != nil {
 			c.Close()
 			break
 		}
 		if rsp := c.handleReq(b[:n:n]); rsp != nil {
-			c.l2conn.Write(rsp)
+			if c.ctx.Err() != nil {
+				c.Close()
+				break
+			}
+			if n, err := c.l2conn.Write(rsp); err != nil || n != len(rsp) {
+				c.Close()
+				break
+			}
 		}
 	}
 }
@@ -259,10 +330,14 @@ func (c *central) handleReadByType(b []byte) []byte {
 				Cap:     valueCap,
 				Offset:  0,
 			}
-			if c, ok := a.pvt.(*Characteristic); ok {
-				c.rhandler.ServeRead(rsp, req)
-			} else if d, ok := a.pvt.(*Descriptor); ok {
-				d.rhandler.ServeRead(rsp, req)
+			if !c.callHandler(func() {
+				if target, ok := a.pvt.(*Characteristic); ok {
+					target.rhandler.ServeRead(rsp, req)
+				} else if target, ok := a.pvt.(*Descriptor); ok {
+					target.rhandler.ServeRead(rsp, req)
+				}
+			}) {
+				return attErrorRsp(attOpReadByTypeReq, a.h, attEcodeUnlikely)
 			}
 			v = rsp.bytes()
 		}
@@ -309,10 +384,14 @@ func (c *central) handleRead(b []byte) []byte {
 			Offset:  0,
 		}
 		rsp := newResponseWriter(valueCap)
-		if c, ok := a.pvt.(*Characteristic); ok {
-			c.rhandler.ServeRead(rsp, req)
-		} else if d, ok := a.pvt.(*Descriptor); ok {
-			d.rhandler.ServeRead(rsp, req)
+		if !c.callHandler(func() {
+			if target, ok := a.pvt.(*Characteristic); ok {
+				target.rhandler.ServeRead(rsp, req)
+			} else if target, ok := a.pvt.(*Descriptor); ok {
+				target.rhandler.ServeRead(rsp, req)
+			}
+		}) {
+			return attErrorRsp(attOpReadReq, h, attEcodeUnlikely)
 		}
 		v = rsp.bytes()
 	}
@@ -348,10 +427,14 @@ func (c *central) handleReadBlob(b []byte) []byte {
 			Offset:  int(offset),
 		}
 		rsp := newResponseWriter(valueCap)
-		if c, ok := a.pvt.(*Characteristic); ok {
-			c.rhandler.ServeRead(rsp, req)
-		} else if d, ok := a.pvt.(*Descriptor); ok {
-			d.rhandler.ServeRead(rsp, req)
+		if !c.callHandler(func() {
+			if target, ok := a.pvt.(*Characteristic); ok {
+				target.rhandler.ServeRead(rsp, req)
+			} else if target, ok := a.pvt.(*Descriptor); ok {
+				target.rhandler.ServeRead(rsp, req)
+			}
+		}) {
+			return attErrorRsp(attOpReadBlobReq, h, attEcodeUnlikely)
 		}
 		v = rsp.bytes()
 		offset = 0 // the server has already adjusted for the offset
@@ -437,12 +520,17 @@ func (c *central) handleWrite(reqType byte, b []byte) []byte {
 	if !a.typ.Equal(attrClientCharacteristicConfigUUID) {
 		// Regular write, not CCC
 		r := Request{Central: c}
+		value = append([]byte(nil), value...)
 		status := byte(StatusUnexpectedError)
-		switch target := a.pvt.(type) {
-		case *Characteristic:
-			status = target.whandler.ServeWrite(r, value)
-		case *Descriptor:
-			status = target.whandler.ServeWrite(r, value)
+		if !c.callHandler(func() {
+			switch target := a.pvt.(type) {
+			case *Characteristic:
+				status = target.whandler.ServeWrite(r, value)
+			case *Descriptor:
+				status = target.whandler.ServeWrite(r, value)
+			}
+		}) {
+			return attErrorRsp(reqType, h, attEcodeUnlikely)
 		}
 		if noRsp {
 			return nil
@@ -464,7 +552,9 @@ func (c *central) handleWrite(reqType byte, b []byte) []byte {
 	ccc := binary.LittleEndian.Uint16(value)
 	// char := a.pvt.(*Descriptor).char
 	if ccc&(gattCCCNotifyFlag|gattCCCIndicateFlag) != 0 {
-		c.startNotify(&a, int(c.mtu-3))
+		if !c.startNotify(&a, int(c.mtu-3)) {
+			return attErrorRsp(reqType, h, attEcodeInsuffResources)
+		}
 	} else {
 		c.stopNotify(&a)
 	}
@@ -500,16 +590,24 @@ func readHandleRange(b []byte) (start, end uint16) {
 	return binary.LittleEndian.Uint16(b), binary.LittleEndian.Uint16(b[2:])
 }
 
-func (c *central) startNotify(a *attr, maxlen int) {
+func (c *central) startNotify(a *attr, maxlen int) bool {
 	c.notifiersmu.Lock()
 	defer c.notifiersmu.Unlock()
 	if _, found := c.notifiers[a.h]; found {
-		return
+		return true
+	}
+	if c.ctx.Err() != nil {
+		return false
 	}
 	char := a.pvt.(*Descriptor).char
 	n := newNotifier(c, a, maxlen)
 	c.notifiers[a.h] = n
-	go char.nhandler.ServeNotify(Request{Central: c}, n)
+	if !startCallout(c.callbackSlots, func() { char.nhandler.ServeNotify(Request{Central: c}, n) }) {
+		delete(c.notifiers, a.h)
+		n.stop()
+		return false
+	}
+	return true
 }
 
 func (c *central) stopNotify(a *attr) {

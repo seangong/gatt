@@ -80,11 +80,12 @@ func (*overflowTestDevice) Close() error { return nil }
 func TestHCIReceiveQueuePreservesOrderAndStopsOnOverflow(t *testing.T) {
 	d := &overflowTestDevice{commands: make(chan []byte, 4)}
 	h := &HCI{
+		d:       d,
 		c:       cmd.NewCmd(d),
 		connsmu: &sync.Mutex{},
 		conns:   make(map[uint16]*conn),
 	}
-	defer h.c.Close()
+	defer h.Close()
 	c := newConn(h, 1)
 	h.conns[c.attr] = c
 	size := cap(c.aclc)
@@ -166,6 +167,9 @@ func TestHCILoopEOFReleasesConnectionIO(t *testing.T) {
 		write <- err
 	}()
 	h.mainLoop()
+	if err := h.Close(); !errors.Is(err, io.EOF) {
+		t.Fatalf("Close() after read EOF = %v, want EOF", err)
+	}
 	for _, result := range []struct {
 		name string
 		err  <-chan error
@@ -254,6 +258,7 @@ func TestHCILoopEOFRejectsLateConnection(t *testing.T) {
 		AcceptMasterHandler: func(*PlatData) { accepted = true },
 	}
 	h.mainLoop()
+	h.Close()
 	packet := make([]byte, 19)
 	packet[0], packet[2], packet[4] = 1, 1, 1
 	h.handleConnection(packet)

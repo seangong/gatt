@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"sync"
+	"sync/atomic"
 )
 
 // Central is the interface that represent a remote central device.
@@ -82,7 +82,9 @@ func (f WriteHandlerFunc) ServeWrite(r Request, data []byte) byte {
 }
 
 // A NotifyHandler handles GATT notification requests.
-// Notifications can be sent using the provided notifier.
+// Notifications can be sent using the provided notifier. Handlers should
+// observe Request.Context or Notifier.Done so they can release their resources
+// when the connection ends.
 type NotifyHandler interface {
 	ServeNotify(r Request, n Notifier)
 }
@@ -108,7 +110,8 @@ type Notifier interface {
 	Write(data []byte) (int, error)
 
 	// Done reports whether the central has requested not to
-	// receive any more notifications with this notifier.
+	// receive any more notifications with this notifier. A transport write
+	// already in progress may finish after Done becomes true.
 	Done() bool
 
 	// Cap returns the maximum number of bytes that may be sent
@@ -120,8 +123,7 @@ type notifier struct {
 	central *central
 	a       *attr
 	maxlen  int
-	donemu  sync.RWMutex
-	done    bool
+	done    atomic.Bool
 }
 
 func newNotifier(c *central, a *attr, maxlen int) *notifier {
@@ -129,22 +131,16 @@ func newNotifier(c *central, a *attr, maxlen int) *notifier {
 }
 
 func (n *notifier) Write(b []byte) (int, error) {
-	n.donemu.RLock()
-	defer n.donemu.RUnlock()
-	if n.done {
+	if n.done.Load() {
 		return 0, errors.New("central stopped notifications")
 	}
 	return n.central.sendNotification(n.a, b)
 }
 
 func (n *notifier) Done() bool {
-	n.donemu.RLock()
-	defer n.donemu.RUnlock()
-	return n.done
+	return n.done.Load()
 }
 
 func (n *notifier) stop() {
-	n.donemu.Lock()
-	n.done = true
-	n.donemu.Unlock()
+	n.done.Store(true)
 }

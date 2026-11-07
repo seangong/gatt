@@ -163,6 +163,7 @@ func TestHCICloseWaitsForOverflowDisconnect(t *testing.T) {
 		defer func() {
 			// Cancel a pending Disconnect even if an assertion fails before
 			// its controller status is delivered.
+			h.requestClose(io.ErrClosedPipe)
 			h.c.Close()
 			synctest.Wait()
 			if closeStarted {
@@ -221,11 +222,20 @@ func TestHCICloseWaitsForOverflowDisconnect(t *testing.T) {
 		synctest.Wait()
 		select {
 		case err := <-closeResult:
+			t.Fatalf("HCI.Close returned before DisconnectionComplete: %v", err)
+		default:
+		}
+		if err := h.handleDisconnectionComplete([]byte{0, 1, 0, 0x13}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		select {
+		case err := <-closeResult:
 			if err != nil {
 				t.Fatal(err)
 			}
 		default:
-			t.Fatal("HCI.Close did not finish after Disconnect status")
+			t.Fatal("HCI.Close did not finish after DisconnectionComplete")
 		}
 		select {
 		case <-d.closed:

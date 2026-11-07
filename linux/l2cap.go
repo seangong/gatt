@@ -1,6 +1,7 @@
 package linux
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -41,21 +42,31 @@ func (a *aclData) unmarshal(b []byte) error {
 type conn struct {
 	hci            *HCI
 	attr           uint16
+	origin         *PlatData // Original Connect argument, protected by hci.connsmu.
 	aclc           chan []byte
 	done           chan struct{}
 	disconnecting  bool // Protected by hci.connsmu.
 	disconnectDone chan struct{}
 	disconnectErr  error  // Published by closing disconnectDone.
 	rxPDU          []byte // Partial L2CAP PDU, protected by hci.connsmu.
+	linkDone       chan struct{}
+	linkClosed     bool  // Protected by hci.connsmu.
+	linkErr        error // Published by closing linkDone.
+	ctx            context.Context
+	cancel         context.CancelFunc
+	writeGate      chan struct{}
 }
 
 func newConn(hci *HCI, hh uint16) *conn {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &conn{
 		hci:            hci,
 		attr:           hh,
 		aclc:           make(chan []byte, l2capReceiveQueueSize),
 		done:           make(chan struct{}),
 		disconnectDone: make(chan struct{}),
+		linkDone:       make(chan struct{}),
+		ctx:            ctx, cancel: cancel, writeGate: make(chan struct{}, 1),
 	}
 }
 
@@ -63,10 +74,46 @@ func newConn(hci *HCI, hh uint16) *conn {
 // done wakes blocked readers and writers without racing with packet delivery.
 func (c *conn) stop() {
 	c.rxPDU = nil
+	c.cancel()
 	select {
 	case <-c.done:
 	default:
 		close(c.done)
+	}
+}
+
+func (c *conn) Context() context.Context { return c.ctx }
+
+// Abort stops this connection without waiting for the caller's protocol loop.
+func (c *conn) Abort(cause error) {
+	h := c.hci
+	h.connsmu.Lock()
+	select {
+	case <-c.done:
+		h.connsmu.Unlock()
+		return
+	default:
+	}
+	c.stop()
+	h.connsmu.Unlock()
+	log.Printf("l2conn: aborting handle 0x%04X: %v", c.attr, cause)
+	h.startWorker(func() {
+		if err := c.Close(); err != nil {
+			log.Printf("l2conn: abort cleanup: %v (cause: %v)", err, cause)
+		}
+	})
+}
+
+// terminate publishes a physical disconnection or a closed transport.
+// The caller holds hci.connsmu.
+func (c *conn) terminate(err error) {
+	c.stop()
+	// Reused callback objects must not retain a chain of retired connections.
+	c.origin = nil
+	if !c.linkClosed {
+		c.linkErr = err
+		c.linkClosed = true
+		close(c.linkDone)
 	}
 }
 
@@ -86,6 +133,12 @@ func (c *conn) updateConnection() (int, error) {
 // It first prepend the l2cap header (4-bytes), and diassemble the payload
 // if it is larger than the HCI LE buffer size that the conntroller can support.
 func (c *conn) write(cid int, b []byte) (int, error) {
+	select {
+	case <-c.done:
+		return 0, io.ErrClosedPipe
+	case c.writeGate <- struct{}{}:
+	}
+	defer func() { <-c.writeGate }()
 	flag := uint8(0) // ACL data continuation flag
 	tlen := len(b)   // Total length of the l2cap payload
 
@@ -129,7 +182,19 @@ func (c *conn) write(cid int, b []byte) (int, error) {
 		default:
 		}
 
-		c.hci.d.Write(w[:5+dlen])
+		packet := w[:5+dlen]
+		written, err := c.hci.d.Write(packet)
+		if err == nil && written != len(packet) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			select {
+			case <-c.hci.bufCnt:
+			default:
+			}
+			c.hci.requestClose(fmt.Errorf("hci: write ACL packet: %w", err))
+			return max(0, tlen-n), err
+		}
 		w = w[dlen:] // advance the pointer to the next segment, if any.
 		flag = 0x10  // the rest of iterations attr continued segments, if any.
 		n -= dlen
@@ -171,26 +236,77 @@ func (c *conn) Write(b []byte) (int, error) {
 	return c.write(0x04, b)
 }
 
-// Close disconnects the connection by sending HCI disconnect command to the device.
+// Close stops local IO and waits for the controller's disconnection event.
 func (c *conn) Close() error {
+	c.hci.connsmu.Lock()
+	registered := c.hci.conns[c.attr] == c
+	c.hci.connsmu.Unlock()
+	if !registered {
+		select {
+		case <-c.disconnectDone:
+			return c.disconnectErr
+		default:
+			return nil
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), hciCloseTimeout)
+	watchDone := make(chan struct{})
+	stopWatch := context.AfterFunc(ctx, func() {
+		c.hci.requestClose(fmt.Errorf("l2conn: close handle 0x%04X: %w", c.attr, ctx.Err()))
+		close(watchDone)
+	})
+	defer func() {
+		if !stopWatch() {
+			<-watchDone
+		}
+		cancel()
+	}()
+	if err := c.disconnect(ctx); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		c.hci.requestClose(err)
+		return err
+	}
+	select {
+	case <-c.linkDone:
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return c.linkErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// disconnect sends at most one Disconnect. Command acceptance and physical
+// disconnection have separate completion signals.
+func (c *conn) disconnect(ctx context.Context) error {
 	h := c.hci
-	hh := c.attr
 	h.connsmu.Lock()
-	current, found := h.conns[hh]
+	current, found := h.conns[c.attr]
 	if !found || current != c {
 		h.connsmu.Unlock()
 		return nil
 	}
 	if c.disconnecting {
 		h.connsmu.Unlock()
-		<-c.disconnectDone
-		return c.disconnectErr
+		select {
+		case <-c.disconnectDone:
+			return c.disconnectErr
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	c.disconnecting = true
 	c.stop()
 	h.connsmu.Unlock()
 
-	if _, err := h.c.Send(cmd.Disconnect{ConnectionHandle: hh, Reason: 0x13}); err != nil {
+	cp := cmd.Disconnect{ConnectionHandle: c.attr, Reason: 0x13}
+	// Disconnect is cleanup even before HCI shutdown begins. Keep a queued
+	// request admissible when BeginShutdown rejects ordinary commands.
+	_, err := h.c.SendShutdownContext(ctx, cp)
+	if err != nil {
 		c.disconnectErr = fmt.Errorf("l2conn: failed to disconnect: %w", err)
 	}
 	close(c.disconnectDone)

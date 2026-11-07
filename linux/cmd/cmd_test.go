@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -194,4 +196,265 @@ func TestCommandStatusCompletesSend(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("command status did not finish Send")
 	}
+}
+
+type commandTestResult struct {
+	response []byte
+	err      error
+}
+
+func TestSendContextCanceledBeforeSend(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		writes := make(chan []byte, 1)
+		c := NewCmd(commandTestWriter(func(b []byte) (int, error) {
+			writes <- append([]byte(nil), b...)
+			return len(b), nil
+		}))
+		defer func() { c.Close(); c.Wait() }()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := c.SendContext(ctx, commandTestParam(1)); !errors.Is(err, context.Canceled) {
+			t.Fatalf("SendContext() = %v, want canceled", err)
+		}
+		if len(writes) != 0 {
+			t.Fatal("canceled command reached the device")
+		}
+		result := make(chan commandTestResult, 1)
+		go func() {
+			response, err := c.SendContext(context.Background(), commandTestParam(2))
+			result <- commandTestResult{response, err}
+		}()
+		synctest.Wait()
+		if raw := <-writes; raw[4] != 2 {
+			t.Fatalf("next command = %x, want value 2", raw)
+		}
+		if err := c.HandleComplete([]byte{1, 1, 0xfc, 2}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		got := <-result
+		if got.err != nil || !bytes.Equal(got.response, []byte{2}) {
+			t.Fatalf("next SendContext() = (%x, %v), want (02, nil)", got.response, got.err)
+		}
+	})
+}
+
+func TestSendContextCanceledWhileQueued(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		name := "ordinary"
+		if shutdown {
+			name = "shutdown"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				writes := make(chan []byte, 2)
+				c := NewCmd(commandTestWriter(func(b []byte) (int, error) {
+					writes <- append([]byte(nil), b...)
+					return len(b), nil
+				}))
+				defer func() { c.Close(); c.Wait() }()
+				first := make(chan commandTestResult, 1)
+				go func() {
+					response, err := c.Send(commandTestParam(1))
+					first <- commandTestResult{response, err}
+				}()
+				<-writes
+				send := c.SendContext
+				if shutdown {
+					c.BeginShutdown()
+					send = c.SendShutdownContext
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				queued := make(chan error, 1)
+				go func() { _, err := send(ctx, commandTestParam(2)); queued <- err }()
+				synctest.Wait()
+				cancel()
+				synctest.Wait()
+				if err := <-queued; !errors.Is(err, context.Canceled) {
+					t.Fatalf("queued SendContext() = %v, want canceled", err)
+				}
+				if len(writes) != 0 {
+					t.Fatal("queued canceled command reached the device")
+				}
+				if err := c.HandleComplete([]byte{1, 1, 0xfc, 1}); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				got := <-first
+				if got.err != nil || !bytes.Equal(got.response, []byte{1}) {
+					t.Fatalf("in-flight Send() = (%x, %v), want (01, nil)", got.response, got.err)
+				}
+			})
+		})
+	}
+}
+
+func TestSendContextCancellationAfterWriteStopsCommandProcessing(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		name := "cancel"
+		if deadline {
+			name = "deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				writes := make(chan []byte, 2)
+				c := NewCmd(commandTestWriter(func(b []byte) (int, error) {
+					writes <- append([]byte(nil), b...)
+					return len(b), nil
+				}))
+				defer func() { c.Close(); c.Wait() }()
+				ctx, cancel := context.WithCancel(context.Background())
+				wantErr := error(context.Canceled)
+				if deadline {
+					cancel()
+					ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+					wantErr = context.DeadlineExceeded
+				}
+				defer cancel()
+				result := make(chan error, 1)
+				go func() { _, err := c.SendContext(ctx, commandTestParam(1)); result <- err }()
+				<-writes
+				queued := make(chan error, 1)
+				go func() { _, err := c.Send(commandTestParam(2)); queued <- err }()
+				synctest.Wait()
+				if deadline {
+					time.Sleep(time.Second)
+				} else {
+					cancel()
+				}
+				synctest.Wait()
+				if err := <-result; !errors.Is(err, wantErr) {
+					t.Fatalf("in-flight SendContext() = %v, want %v", err, wantErr)
+				}
+				if err := <-queued; !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("queued Send() = %v, want closed pipe", err)
+				}
+				c.Wait()
+				if _, err := c.Send(commandTestParam(3)); !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("Send() after cancellation = %v, want closed pipe", err)
+				}
+				if err := c.HandleComplete([]byte{1, 1, 0xfc, 1}); !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("late completion = %v, want closed pipe", err)
+				}
+				if len(writes) != 0 {
+					t.Fatal("another command was written after losing an in-flight response")
+				}
+			})
+		})
+	}
+}
+
+func TestBeginShutdownPreservesInFlightCommand(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		writes := make(chan []byte, 2)
+		c := NewCmd(commandTestWriter(func(b []byte) (int, error) {
+			writes <- append([]byte(nil), b...)
+			return len(b), nil
+		}))
+		defer func() { c.Close(); c.Wait() }()
+		first := make(chan commandTestResult, 1)
+		go func() {
+			response, err := c.Send(commandTestParam(1))
+			first <- commandTestResult{response, err}
+		}()
+		<-writes
+		queued := make(chan error, 1)
+		go func() { _, err := c.Send(commandTestParam(2)); queued <- err }()
+		synctest.Wait()
+		c.BeginShutdown()
+		c.BeginShutdown()
+		synctest.Wait()
+		if err := <-queued; !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("queued Send() after BeginShutdown = %v, want closed pipe", err)
+		}
+		if _, err := c.Send(commandTestParam(3)); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("new Send() after BeginShutdown = %v, want closed pipe", err)
+		}
+		shutdown := make(chan commandTestResult, 1)
+		go func() {
+			response, err := c.SendShutdownContext(context.Background(), commandTestParam(4))
+			shutdown <- commandTestResult{response, err}
+		}()
+		synctest.Wait()
+		if len(writes) != 0 {
+			t.Fatal("another command was written before the in-flight command completed")
+		}
+		if err := c.HandleComplete([]byte{1, 1, 0xfc, 1}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if got := <-first; got.err != nil || !bytes.Equal(got.response, []byte{1}) {
+			t.Fatalf("in-flight Send() = (%x, %v), want (01, nil)", got.response, got.err)
+		}
+		if raw := <-writes; raw[4] != 4 {
+			t.Fatalf("shutdown command = %x, want value 4", raw)
+		}
+		if err := c.HandleComplete([]byte{1, 1, 0xfc, 4}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if got := <-shutdown; got.err != nil || !bytes.Equal(got.response, []byte{4}) {
+			t.Fatalf("shutdown Send() = (%x, %v), want (04, nil)", got.response, got.err)
+		}
+	})
+}
+
+func TestNonzeroCommandStatusReportsFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		writes := make(chan []byte, 1)
+		c := NewCmd(commandTestWriter(func(b []byte) (int, error) {
+			writes <- append([]byte(nil), b...)
+			return len(b), nil
+		}))
+		defer func() { c.Close(); c.Wait() }()
+		result := make(chan error, 1)
+		go func() { _, err := c.Send(commandTestParam(1)); result <- err }()
+		<-writes
+		if err := c.HandleStatus([]byte{0x0c, 1, 1, 0xfc}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if err := <-result; err == nil {
+			t.Fatal("nonzero Command Status returned success")
+		}
+		go func() { _, err := c.Send(commandTestParam(2)); result <- err }()
+		<-writes
+		if err := c.HandleStatus([]byte{0, 1, 1, 0xfc}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if err := <-result; err != nil {
+			t.Fatalf("next Send() = %v, want nil", err)
+		}
+	})
+}
+
+func TestSendAndCheckRespContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		writes := make(chan []byte, 1)
+		c := NewCmd(commandTestWriter(func(b []byte) (int, error) {
+			writes <- append([]byte(nil), b...)
+			return len(b), nil
+		}))
+		defer func() { c.Close(); c.Wait() }()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := c.SendAndCheckRespContext(ctx, commandTestParam(1), []byte{0}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("SendAndCheckRespContext() = %v, want canceled", err)
+		}
+		if len(writes) != 0 {
+			t.Fatal("canceled command reached the device")
+		}
+		result := make(chan error, 1)
+		go func() { result <- c.SendAndCheckRespContext(context.Background(), commandTestParam(2), []byte{0}) }()
+		<-writes
+		if err := c.HandleComplete([]byte{1, 1, 0xfc, 0}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+	})
 }

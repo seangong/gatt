@@ -1,8 +1,12 @@
 package gatt
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
+	"io"
 	"net"
+	"sync"
 
 	"github.com/seangong/gatt/v2/linux"
 	"github.com/seangong/gatt/v2/linux/cmd"
@@ -11,12 +15,25 @@ import (
 type device struct {
 	deviceHandler
 
-	hci   *linux.HCI
-	state State
+	hci            *linux.HCI
+	state          State
+	closeHCI       func() error
+	mu             sync.Mutex
+	ctx            context.Context
+	cancel         context.CancelFunc
+	initialized    bool
+	stopping       bool
+	stopDone       chan struct{}
+	stopErr        error
+	workers        sync.WaitGroup
+	lifecycleSlots chan struct{}
+	requestSlots   chan struct{}
+	callbackSlots  chan struct{}
 
 	// All the following fields are only used peripheralManager (server) implementation.
-	svcs  []*Service
-	attrs *attrRange
+	servicesMu sync.Mutex
+	svcs       []*Service
+	attrs      *attrRange
 
 	devID   int
 	chkLE   bool
@@ -60,37 +77,81 @@ func NewDevice(opts ...Option) (Device, error) {
 	}
 
 	d.hci = h
+	d.closeHCI = h.Close
+	d.initLifecycleLocked()
 	return d, nil
 }
 
+func (d *device) initLifecycleLocked() {
+	if d.ctx != nil {
+		return
+	}
+	d.ctx, d.cancel = context.WithCancel(context.Background())
+	d.stopDone = make(chan struct{})
+	d.lifecycleSlots = make(chan struct{}, max(1, d.maxConn)*2)
+	d.requestSlots = make(chan struct{}, max(1, d.maxConn)*2)
+	d.callbackSlots = make(chan struct{}, max(1, d.maxConn)*16)
+}
+
 func (d *device) Init(f func(Device, State)) error {
+	d.mu.Lock()
+	d.initLifecycleLocked()
+	if d.stopping {
+		d.mu.Unlock()
+		return io.ErrClosedPipe
+	}
+	if d.initialized {
+		d.mu.Unlock()
+		return errors.New("device already initialized")
+	}
+	d.initialized = true
+	d.state = StatePoweredOn
+	d.stateChanged = f
+	d.mu.Unlock()
 	d.hci.AcceptMasterHandler = func(pd *linux.PlatData) {
 		a := pd.Address
-		c := newCentral(d.attrs, net.HardwareAddr([]byte{a[5], a[4], a[3], a[2], a[1], a[0]}), pd.Conn)
-		if d.centralConnected != nil {
-			d.centralConnected(c)
-		}
-		c.loop()
-		if d.centralDisconnected != nil {
-			d.centralDisconnected(c)
-		}
+		d.mu.Lock()
+		attrs := d.attrs
+		d.mu.Unlock()
+		c := newCentral(attrs, net.HardwareAddr([]byte{a[5], a[4], a[3], a[2], a[1], a[0]}), pd.Conn)
+		c.requestSlots, c.callbackSlots = d.requestSlots, d.callbackSlots
+		stopCancel := context.AfterFunc(d.ctx, c.cancel)
+		d.runConnection(c.Context(), true, func() {
+			if d.centralConnected != nil {
+				d.centralConnected(c)
+			}
+		}, c.loop, func() {
+			if d.centralDisconnected != nil {
+				d.centralDisconnected(c)
+			}
+		}, func() error {
+			stopCancel()
+			return c.Close()
+		})
 	}
 	d.hci.AcceptSlaveHandler = func(pd *linux.PlatData) {
 		p := &peripheral{
-			d:     d,
-			pd:    pd,
-			l2c:   pd.Conn,
-			reqc:  make(chan message),
-			quitc: make(chan struct{}),
-			sub:   newSubscriber(),
+			d:       d,
+			pd:      pd,
+			l2c:     pd.Conn,
+			reqc:    make(chan message),
+			quitc:   make(chan struct{}),
+			sub:     newSubscriber(),
+			callout: d.startCallback,
 		}
-		if d.peripheralConnected != nil {
-			go d.peripheralConnected(p, nil)
+		ctx := d.ctx
+		if conn, ok := pd.Conn.(interface{ Context() context.Context }); ok {
+			ctx = conn.Context()
 		}
-		p.loop()
-		if d.peripheralDisconnected != nil {
-			d.peripheralDisconnected(p, nil)
-		}
+		d.runConnection(ctx, false, func() {
+			if d.peripheralConnected != nil {
+				d.peripheralConnected(p, nil)
+			}
+		}, p.loop, func() {
+			if d.peripheralDisconnected != nil {
+				d.peripheralDisconnected(p, nil)
+			}
+		}, pd.Conn.Close)
 	}
 	d.hci.AdvertisementHandler = func(pd *linux.PlatData) {
 		a := &Advertisement{}
@@ -99,37 +160,174 @@ func (d *device) Init(f func(Device, State)) error {
 		p := &peripheral{pd: pd, d: d}
 		if d.peripheralDiscovered != nil {
 			pd.Name = a.LocalName
-			d.peripheralDiscovered(p, a, int(pd.RSSI))
+			d.startCallback(func() { d.peripheralDiscovered(p, a, int(pd.RSSI)) })
 		}
 	}
-	d.state = StatePoweredOn
-	d.stateChanged = f
-	go d.stateChanged(d, d.state)
+	if f != nil {
+		// Preserve state callback order without including user code in the core
+		// shutdown wait. Either callback may itself call Stop.
+		go func() {
+			f(d, StatePoweredOn)
+			<-d.stopDone
+			f(d, StatePoweredOff)
+		}()
+	}
 	return nil
 }
 
+func (d *device) startCallback(f func()) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stopping {
+		return false
+	}
+	return startCallout(d.callbackSlots, f)
+}
+
+// runConnection separates cancelable protocol work from ordered application
+// callbacks. A stuck callback retains its lifecycle slot after disconnection.
+func (d *device) runConnection(ctx context.Context, waitConnected bool, connected, run, disconnected func(), closeConn func() error) {
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		return
+	}
+	select {
+	case d.lifecycleSlots <- struct{}{}:
+	default:
+		d.workers.Go(func() { _ = closeConn() })
+		d.mu.Unlock()
+		return
+	}
+	d.workers.Add(1)
+	d.mu.Unlock()
+	ready, coreDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer d.workers.Done()
+		defer close(coreDone)
+		defer func() { _ = closeConn() }()
+		// Servers must finish Connected registration before handling ATT.
+		// Client callbacks may themselves issue synchronous ATT requests, so
+		// their protocol loop must start without waiting for Connected.
+		if waitConnected {
+			select {
+			case <-ctx.Done():
+				return
+			case <-d.ctx.Done():
+				return
+			case <-ready:
+			}
+		}
+		if ctx.Err() == nil && d.ctx.Err() == nil {
+			run()
+		}
+	}()
+	go func() {
+		defer func() { <-d.lifecycleSlots }()
+		if ctx.Err() != nil || d.ctx.Err() != nil {
+			return
+		}
+		connected()
+		close(ready)
+		<-coreDone
+		d.mu.Lock()
+		stopping := d.stopping
+		d.mu.Unlock()
+		if stopping {
+			<-d.stopDone
+		}
+		disconnected()
+	}()
+}
+
+// Stop closes the Linux device and waits for its protocol workers. Application
+// callbacks are canceled cooperatively and may finish after Stop returns.
 func (d *device) Stop() error {
-	d.state = StatePoweredOff
-	defer d.stateChanged(d, d.state)
-	return d.hci.Close()
+	return d.StopContext(context.Background())
+}
+
+// StopContext starts final device shutdown once and waits for completion or
+// ctx cancellation. Canceling ctx only stops this caller's wait; the shared
+// shutdown continues until its resources and protocol workers are released.
+func (d *device) StopContext(ctx context.Context) error {
+	d.mu.Lock()
+	d.initLifecycleLocked()
+	if !d.stopping {
+		d.stopping = true
+		d.state = StatePoweredOff
+		d.cancel()
+		go func() {
+			err := d.closeHCI()
+			d.workers.Wait()
+			d.stopErr = err
+			close(d.stopDone)
+		}()
+	}
+	done := d.stopDone
+	d.mu.Unlock()
+	select {
+	case <-done:
+		return d.stopErr
+	default:
+	}
+	select {
+	case <-done:
+		return d.stopErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (d *device) AddService(s *Service) error {
-	d.svcs = append(d.svcs, s)
-	d.attrs = generateAttributes(d.svcs, uint16(1)) // ble attrs start at 1
+	d.servicesMu.Lock()
+	defer d.servicesMu.Unlock()
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		return io.ErrClosedPipe
+	}
+	services := append(append([]*Service(nil), d.svcs...), s)
+	d.mu.Unlock()
+	attrs := generateAttributes(services, uint16(1)) // ble attrs start at 1
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stopping {
+		return io.ErrClosedPipe
+	}
+	d.svcs, d.attrs = services, attrs
 	return nil
 }
 
 func (d *device) RemoveAllServices() error {
+	d.servicesMu.Lock()
+	defer d.servicesMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stopping {
+		return io.ErrClosedPipe
+	}
 	d.svcs = nil
 	d.attrs = nil
 	return nil
 }
 
 func (d *device) SetServices(s []*Service) error {
-	d.RemoveAllServices()
-	d.svcs = append(d.svcs, s...)
-	d.attrs = generateAttributes(d.svcs, uint16(1)) // ble attrs start at 1
+	d.servicesMu.Lock()
+	defer d.servicesMu.Unlock()
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		return io.ErrClosedPipe
+	}
+	d.mu.Unlock()
+	services := append([]*Service(nil), s...)
+	attrs := generateAttributes(services, uint16(1)) // ble attrs start at 1
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stopping {
+		return io.ErrClosedPipe
+	}
+	d.svcs, d.attrs = services, attrs
 	return nil
 }
 

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -20,11 +21,14 @@ type CmdParam interface {
 
 func NewCmd(d io.Writer) *Cmd {
 	c := &Cmd{
-		dev:     d,
-		sent:    []*cmdPkt{},
-		compc:   make(chan evt.CommandCompleteEP),
-		statusc: make(chan evt.CommandStatusEP),
-		done:    make(chan struct{}),
+		dev:        d,
+		sent:       []*cmdPkt{},
+		sendGate:   make(chan struct{}, 1),
+		compc:      make(chan evt.CommandCompleteEP),
+		statusc:    make(chan evt.CommandStatusEP),
+		shutdown:   make(chan struct{}),
+		done:       make(chan struct{}),
+		workerDone: make(chan struct{}),
 	}
 	go c.processCmdEvents()
 	return c
@@ -33,7 +37,12 @@ func NewCmd(d io.Writer) *Cmd {
 type cmdPkt struct {
 	op   int
 	cp   CmdParam
-	done chan []byte
+	done chan cmdResult
+}
+
+type cmdResult struct {
+	response []byte
+	err      error
 }
 
 func (c cmdPkt) Marshal() []byte {
@@ -47,14 +56,17 @@ func (c cmdPkt) Marshal() []byte {
 }
 
 type Cmd struct {
-	sendMu    sync.Mutex // Serialize complete command transactions.
-	sentMu    sync.Mutex // Protect sent from the event worker and Send cleanup.
-	dev       io.Writer
-	sent      []*cmdPkt
-	compc     chan evt.CommandCompleteEP
-	statusc   chan evt.CommandStatusEP
-	done      chan struct{}
-	closeOnce sync.Once
+	sendGate     chan struct{} // Serialize complete command transactions.
+	sentMu       sync.Mutex    // Protect sent from the event worker and Send cleanup.
+	dev          io.Writer
+	sent         []*cmdPkt
+	compc        chan evt.CommandCompleteEP
+	statusc      chan evt.CommandStatusEP
+	shutdown     chan struct{}
+	shutdownOnce sync.Once
+	done         chan struct{}
+	workerDone   chan struct{}
+	closeOnce    sync.Once
 }
 
 func (c *Cmd) trace(fmt string, v ...interface{}) {}
@@ -100,18 +112,76 @@ func (c *Cmd) Close() {
 	c.closeOnce.Do(func() { close(c.done) })
 }
 
+// Wait waits for the command event worker to exit. Call Close before waiting.
+// It does not wait for Send calls blocked in the underlying device's Write.
+func (c *Cmd) Wait() {
+	<-c.workerDone
+}
+
+// BeginShutdown rejects unsent ordinary commands without interrupting the
+// command already waiting for its controller response.
+func (c *Cmd) BeginShutdown() {
+	c.shutdownOnce.Do(func() { close(c.shutdown) })
+}
+
 func (c *Cmd) Send(cp CmdParam) ([]byte, error) {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
+	return c.SendContext(context.Background(), cp)
+}
+
+// SendContext waits for the serial command slot and controller response until
+// ctx is canceled or the command processor is closed. Canceling after a command
+// is written closes the processor: a late response must not match a later
+// command with the same opcode. It cannot interrupt the device's Write.
+func (c *Cmd) SendContext(ctx context.Context, cp CmdParam) ([]byte, error) {
+	return c.sendContext(ctx, cp, false)
+}
+
+// SendShutdownContext sends a cleanup command before or after BeginShutdown
+// rejects ordinary commands. It uses the same serial slot and cancellation
+// rules as SendContext and cannot send after Close.
+func (c *Cmd) SendShutdownContext(ctx context.Context, cp CmdParam) ([]byte, error) {
+	return c.sendContext(ctx, cp, true)
+}
+
+func (c *Cmd) sendContext(ctx context.Context, cp CmdParam, shutdown bool) ([]byte, error) {
+	var stopping <-chan struct{}
+	if !shutdown {
+		stopping = c.shutdown
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	select {
 	case <-c.done:
 		return nil, io.ErrClosedPipe
+	case <-stopping:
+		return nil, io.ErrClosedPipe
 	default:
 	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.done:
+		return nil, io.ErrClosedPipe
+	case <-stopping:
+		return nil, io.ErrClosedPipe
+	case c.sendGate <- struct{}{}:
+	}
+	defer func() { <-c.sendGate }()
 
 	op := cp.Opcode()
-	p := &cmdPkt{op: op, cp: cp, done: make(chan []byte, 1)}
+	p := &cmdPkt{op: op, cp: cp, done: make(chan cmdResult, 1)}
 	raw := p.Marshal()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-c.done:
+		return nil, io.ErrClosedPipe
+	case <-stopping:
+		return nil, io.ErrClosedPipe
+	default:
+	}
 
 	c.sentMu.Lock()
 	c.sent = append(c.sent, p)
@@ -132,21 +202,36 @@ func (c *Cmd) Send(cp CmdParam) ([]byte, error) {
 		return nil, errors.New("Failed to send whole Cmd pkt to HCI socket")
 	}
 	select {
+	case <-ctx.Done():
+		c.Close()
+		return nil, ctx.Err()
 	case <-c.done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return nil, io.ErrClosedPipe
-	case response := <-p.done:
-		return response, nil
+	case result := <-p.done:
+		return result.response, result.err
 	}
 }
 
 func (c *Cmd) SendAndCheckResp(cp CmdParam, exp []byte) error {
-	rsp, err := c.Send(cp)
+	return c.SendAndCheckRespContext(context.Background(), cp, exp)
+}
+
+// SendAndCheckRespContext sends a command with SendContext and checks the first
+// response byte against exp when exp is nonempty.
+func (c *Cmd) SendAndCheckRespContext(ctx context.Context, cp CmdParam, exp []byte) error {
+	rsp, err := c.SendContext(ctx, cp)
 	if err != nil {
 		return err
 	}
 	// Don't care about the response
 	if len(exp) == 0 {
 		return nil
+	}
+	if len(rsp) == 0 {
+		return fmt.Errorf("HCI command: '0x%04x' returned no status, expect: [%X]", cp.Opcode(), exp)
 	}
 	// Check the if status is one of the expected value
 	if !bytes.Contains(exp, rsp[0:1]) {
@@ -156,6 +241,7 @@ func (c *Cmd) SendAndCheckResp(cp CmdParam, exp []byte) error {
 }
 
 func (c *Cmd) processCmdEvents() {
+	defer close(c.workerDone)
 	for {
 		select {
 		case <-c.done:
@@ -174,7 +260,11 @@ func (c *Cmd) processCmdEvents() {
 			if pending == nil {
 				log.Printf("Can't find the cmdPkt for this CommandStatusEP: %v", status)
 			} else {
-				close(pending.done)
+				var err error
+				if status.Status != 0 {
+					err = fmt.Errorf("HCI command 0x%04x failed with status 0x%02x", status.CommandOpcode, status.Status)
+				}
+				pending.done <- cmdResult{err: err}
 			}
 		case comp := <-c.compc:
 			var pending *cmdPkt
@@ -190,7 +280,7 @@ func (c *Cmd) processCmdEvents() {
 			if pending == nil {
 				log.Printf("Can't find the cmdPkt for this CommandCompleteEP: %v", comp)
 			} else {
-				pending.done <- comp.ReturnParameters
+				pending.done <- cmdResult{response: comp.ReturnParameters}
 			}
 		}
 	}
