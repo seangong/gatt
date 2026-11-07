@@ -393,19 +393,34 @@ func (h *HCI) setAdvertiseEnable(en bool) error {
 	if full {
 		return nil
 	}
-	return h.c.SendAndCheckResp(cmd.LESetAdvertiseEnable{AdvertisingEnable: btoi(en)}, []byte{0})
+	if err := h.c.SendAndCheckResp(cmd.LESetAdvertiseEnable{AdvertisingEnable: btoi(en)}, []byte{0}); err != nil {
+		return fmt.Errorf("hci: set advertising enabled=%t: %w", en, err)
+	}
+	return nil
 }
 
 func (h *HCI) SendCmdWithAdvOff(cp cmd.CmdParam) error {
-	if err := h.setAdvertiseEnable(false); err != nil {
-		return err
-	}
-	err := h.c.SendAndCheckResp(cp, nil)
 	h.advmu.Lock()
 	advertising := h.adv
 	h.advmu.Unlock()
+	// Reset leaves advertising disabled. Only pause an active advertising
+	// configuration before updating it.
 	if advertising {
-		err = errors.Join(err, h.setAdvertiseEnable(true))
+		if err := h.setAdvertiseEnable(false); err != nil {
+			return fmt.Errorf("disable advertising before command 0x%04x: %w", cp.Opcode(), err)
+		}
+	}
+	err := h.c.SendAndCheckResp(cp, []byte{0})
+	if err != nil {
+		err = fmt.Errorf("configure advertising with command 0x%04x: %w", cp.Opcode(), err)
+	}
+	h.advmu.Lock()
+	advertising = h.adv
+	h.advmu.Unlock()
+	if advertising {
+		if restoreErr := h.setAdvertiseEnable(true); restoreErr != nil {
+			err = errors.Join(err, fmt.Errorf("restore advertising after command 0x%04x: %w", cp.Opcode(), restoreErr))
+		}
 	}
 	return err
 }
