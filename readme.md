@@ -47,7 +47,7 @@ either be run as root, or be granted appropriate capabilities:
 Install version 2.0.0:
 
 ```sh
-go get github.com/seangong/gatt/v2@v2.0.0
+go get github.com/seangong/gatt/v2
 ```
 
 Use the v2 module path in imports:
