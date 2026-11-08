@@ -23,30 +23,39 @@ type peripheral struct {
 	// A list of invalid service is provided in the parameter.
 	ServicesModified func(*peripheral, []*Service)
 
-	d    *device
-	svcs []*Service
+	d      *device
+	svcs   []*Service
+	svcsMu sync.RWMutex
+
+	servicesDiscovered        bool
+	characteristicsDiscovered map[*Service]bool
+	descriptorsDiscovered     map[*Characteristic]bool
 
 	sub *subscriber
 
 	mtu uint16 // Owned by requestLoop after the connection starts.
 	l2c io.ReadWriteCloser
 
-	reqc       chan message
-	quitc      chan struct{}
-	stopOnce   sync.Once
-	abortOnce  sync.Once
-	stopErr    error // Published by closing quitc.
-	callout    func(func()) bool
-	notifyOnce sync.Once
-	notifyGate chan struct{}
+	reqc         chan message
+	quitc        chan struct{}
+	stopOnce     sync.Once
+	abortOnce    sync.Once
+	stopErr      error // Published by closing quitc.
+	callout      func(func()) bool
+	metadataOnce sync.Once
+	metadataGate chan struct{}
 
 	pd *linux.PlatData // platform specific data
 }
 
-func (p *peripheral) Device() Device       { return p.d }
-func (p *peripheral) ID() string           { return strings.ToUpper(net.HardwareAddr(p.pd.Address[:]).String()) }
-func (p *peripheral) Name() string         { return p.pd.Name }
-func (p *peripheral) Services() []*Service { return p.svcs }
+func (p *peripheral) Device() Device { return p.d }
+func (p *peripheral) ID() string     { return strings.ToUpper(net.HardwareAddr(p.pd.Address[:]).String()) }
+func (p *peripheral) Name() string   { return p.pd.Name }
+func (p *peripheral) Services() []*Service {
+	p.svcsMu.RLock()
+	defer p.svcsMu.RUnlock()
+	return p.svcs
+}
 
 func finish(op byte, h uint16, b []byte) bool {
 	if len(b) != 5 {
@@ -61,51 +70,100 @@ func finish(op byte, h uint16, b []byte) bool {
 	return done && e == attEcodeAttrNotFound
 }
 
+// lockMetadata serializes complete discovery and CCCD transactions. It is not
+// held by the response pump or notification callbacks, so transport I/O and
+// callbacks can finish while a transaction is waiting for its response.
+func (p *peripheral) lockMetadata() error {
+	if p.l2c == nil || p.reqc == nil || p.quitc == nil {
+		return io.ErrClosedPipe
+	}
+	if err := p.closedError(); err != nil {
+		return err
+	}
+	p.metadataOnce.Do(func() { p.metadataGate = make(chan struct{}, 1) })
+	select {
+	case <-p.quitc:
+		return p.stopErr
+	case <-p.connectionDone():
+		return p.closedError()
+	case p.metadataGate <- struct{}{}:
+	}
+	if err := p.closedError(); err != nil {
+		p.unlockMetadata()
+		return err
+	}
+	return nil
+}
+
+func (p *peripheral) unlockMetadata() { <-p.metadataGate }
+
+func (p *peripheral) databaseChanged(kind string) error {
+	err := fmt.Errorf("discovered %s changed; reconnect before using cached handles: %w", kind, ErrDatabaseChanged)
+	p.abort(err)
+	return err
+}
+
 func (p *peripheral) DiscoverServices(s []UUID) ([]*Service, error) {
 	// TODO: implement the UUID filters
 	// p.pd.Conn.Write([]byte{0x02, 0x87, 0x00}) // MTU
-	done := false
-	start := uint16(0x0001)
-	for !done {
+	if err := p.lockMetadata(); err != nil {
+		return nil, err
+	}
+	defer p.unlockMetadata()
+	var services []*Service
+	for start := 1; start <= 0xffff; {
 		op := byte(attOpReadByGroupReq)
 		b := make([]byte, 7)
 		b[0] = op
-		binary.LittleEndian.PutUint16(b[1:3], start)
-		binary.LittleEndian.PutUint16(b[3:5], 0xFFFF)
+		binary.LittleEndian.PutUint16(b[1:3], uint16(start))
+		binary.LittleEndian.PutUint16(b[3:5], 0xffff)
 		binary.LittleEndian.PutUint16(b[5:7], 0x2800)
 
-		var err error
-		b, err = p.sendReq(op, b)
+		b, err := p.sendReq(op, b)
 		if err != nil {
-			if finish(op, start, b) {
+			if finish(op, uint16(start), b) {
 				break
 			}
 			return nil, err
 		}
-		b = b[1:]
-		l, b := int(b[0]), b[1:]
-		switch {
-		case l == 6 && (len(b)%6 == 0):
-		case l == 20 && (len(b)%20 == 0):
-		default:
+		if len(b) < 2 {
 			return nil, ErrInvalidLength
 		}
-
+		l, b := int(b[1]), b[2:]
+		if (l != 6 && l != 20) || len(b) == 0 || len(b)%l != 0 {
+			return nil, ErrInvalidLength
+		}
 		for len(b) != 0 {
 			h := binary.LittleEndian.Uint16(b[:2])
 			endh := binary.LittleEndian.Uint16(b[2:4])
-			s := &Service{
-				uuid: UUID{b[4:l]},
-				h:    h,
-				endh: endh,
+			if int(h) < start || endh < h {
+				return nil, fmt.Errorf("invalid service range 0x%04x-0x%04x at 0x%04x", h, endh, start)
 			}
-			p.svcs = append(p.svcs, s)
+			services = append(services, &Service{uuid: UUID{b[4:l]}, h: h, endh: endh})
+			start = int(endh) + 1
 			b = b[l:]
-			done = endh == 0xFFFF
-			start = endh + 1
 		}
 	}
-	return p.svcs, nil
+	if err := p.closedError(); err != nil {
+		return nil, err
+	}
+	if p.servicesDiscovered {
+		if len(p.svcs) != len(services) {
+			return nil, p.databaseChanged("services")
+		}
+		for i, s := range services {
+			old := p.svcs[i]
+			if old.h != s.h || old.endh != s.endh || !old.uuid.Equal(s.uuid) {
+				return nil, p.databaseChanged("services")
+			}
+		}
+		return p.svcs, nil
+	}
+	p.svcsMu.Lock()
+	p.svcs = services
+	p.svcsMu.Unlock()
+	p.servicesDiscovered = true
+	return services, nil
 }
 
 func (p *peripheral) DiscoverIncludedServices(ss []UUID, s *Service) ([]*Service, error) {
@@ -115,117 +173,160 @@ func (p *peripheral) DiscoverIncludedServices(ss []UUID, s *Service) ([]*Service
 
 func (p *peripheral) DiscoverCharacteristics(cs []UUID, s *Service) ([]*Characteristic, error) {
 	// TODO: implement the UUID filters
-	done := false
-	start := s.h
-	var prev *Characteristic
-	for !done {
+	if err := p.lockMetadata(); err != nil {
+		return nil, err
+	}
+	defer p.unlockMetadata()
+	if s == nil || s.h == 0 || s.endh < s.h {
+		return nil, errors.New("invalid service range")
+	}
+	var chars []*Characteristic
+	for start := int(s.h); start <= int(s.endh); {
 		op := byte(attOpReadByTypeReq)
 		b := make([]byte, 7)
 		b[0] = op
-		binary.LittleEndian.PutUint16(b[1:3], start)
+		binary.LittleEndian.PutUint16(b[1:3], uint16(start))
 		binary.LittleEndian.PutUint16(b[3:5], s.endh)
 		binary.LittleEndian.PutUint16(b[5:7], 0x2803)
 
-		var err error
-		b, err = p.sendReq(op, b)
+		b, err := p.sendReq(op, b)
 		if err != nil {
-			if finish(op, start, b) {
+			if finish(op, uint16(start), b) {
 				break
 			}
 			return nil, err
 		}
-		b = b[1:]
-
-		l, b := int(b[0]), b[1:]
-		switch {
-		case l == 7 && (len(b)%7 == 0):
-		case l == 21 && (len(b)%21 == 0):
-		default:
+		if len(b) < 2 {
 			return nil, ErrInvalidLength
 		}
-
+		l, b := int(b[1]), b[2:]
+		if (l != 7 && l != 21) || len(b) == 0 || len(b)%l != 0 {
+			return nil, ErrInvalidLength
+		}
 		for len(b) != 0 {
 			h := binary.LittleEndian.Uint16(b[:2])
-			props := Property(b[2])
 			vh := binary.LittleEndian.Uint16(b[3:5])
-			u := UUID{b[5:l]}
-			s := searchService(p.svcs, h, vh)
-			if s == nil {
-				log.Printf("Can't find service range that contains 0x%04X - 0x%04X", h, vh)
-				return nil, fmt.Errorf("Can't find service range that contains 0x%04X - 0x%04X", h, vh)
+			if int(h) < start || h <= s.h || vh <= h || vh > s.endh ||
+				(len(chars) != 0 && h <= chars[len(chars)-1].vh) {
+				return nil, fmt.Errorf("invalid characteristic handles 0x%04x-0x%04x in service 0x%04x-0x%04x", h, vh, s.h, s.endh)
 			}
-			c := &Characteristic{
-				uuid:  u,
-				svc:   s,
-				props: props,
-				h:     h,
-				vh:    vh,
-			}
-			s.chars = append(s.chars, c)
+			chars = append(chars, &Characteristic{uuid: UUID{b[5:l]}, svc: s, props: Property(b[2]), h: h, vh: vh})
+			start = int(h) + 1
 			b = b[l:]
-			done = vh == s.endh
-			start = vh + 1
-			if prev != nil {
-				prev.endh = c.h - 1
-			}
-			prev = c
 		}
 	}
-	if len(s.chars) > 1 {
-		s.chars[len(s.chars)-1].endh = s.endh
+	for i, c := range chars {
+		c.endh = s.endh
+		if i+1 < len(chars) {
+			c.endh = chars[i+1].h - 1
+		}
 	}
-	return s.chars, nil
+	if err := p.closedError(); err != nil {
+		return nil, err
+	}
+	if p.characteristicsDiscovered[s] {
+		if len(s.chars) != len(chars) {
+			return nil, p.databaseChanged("characteristics")
+		}
+		for i, c := range chars {
+			old := s.chars[i]
+			if old.h != c.h || old.vh != c.vh || old.endh != c.endh || old.props != c.props || !old.uuid.Equal(c.uuid) {
+				return nil, p.databaseChanged("characteristics")
+			}
+		}
+		return s.chars, nil
+	}
+	s.chars = chars
+	if p.characteristicsDiscovered == nil {
+		p.characteristicsDiscovered = make(map[*Service]bool)
+	}
+	p.characteristicsDiscovered[s] = true
+	return chars, nil
 }
 
 func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descriptor, error) {
 	// TODO: implement the UUID filters
-	done := false
-	start := c.vh + 1
-	for !done {
-		if c.endh == 0 {
-			c.endh = c.svc.endh
-		}
+	if err := p.lockMetadata(); err != nil {
+		return nil, err
+	}
+	defer p.unlockMetadata()
+	if c == nil || c.vh == 0 {
+		return nil, errors.New("invalid characteristic value handle")
+	}
+	endh := c.endh
+	if endh == 0 && c.svc != nil {
+		endh = c.svc.endh
+	}
+	if c.vh > endh {
+		return nil, fmt.Errorf("invalid descriptor range after 0x%04x ending at 0x%04x", c.vh, endh)
+	}
+	var descs []*Descriptor
+	var cccd *Descriptor
+	for start := int(c.vh) + 1; start <= int(endh); {
 		op := byte(attOpFindInfoReq)
 		b := make([]byte, 5)
 		b[0] = op
-		binary.LittleEndian.PutUint16(b[1:3], start)
-		binary.LittleEndian.PutUint16(b[3:5], c.endh)
+		binary.LittleEndian.PutUint16(b[1:3], uint16(start))
+		binary.LittleEndian.PutUint16(b[3:5], endh)
 
-		var err error
-		b, err = p.sendReq(op, b)
+		b, err := p.sendReq(op, b)
 		if err != nil {
-			if finish(attOpFindInfoReq, start, b) {
+			if finish(op, uint16(start), b) {
 				break
 			}
 			return nil, err
 		}
-		b = b[1:]
-
+		if len(b) < 2 {
+			return nil, ErrInvalidLength
+		}
 		var l int
-		f, b := int(b[0]), b[1:]
-		switch {
-		case f == 1 && (len(b)%4 == 0):
+		switch b[1] {
+		case 1:
 			l = 4
-		case f == 2 && (len(b)%18 == 0):
+		case 2:
 			l = 18
 		default:
 			return nil, ErrInvalidLength
 		}
-
+		b = b[2:]
+		if len(b) == 0 || len(b)%l != 0 {
+			return nil, ErrInvalidLength
+		}
 		for len(b) != 0 {
 			h := binary.LittleEndian.Uint16(b[:2])
-			u := UUID{b[2:l]}
-			d := &Descriptor{uuid: u, h: h, char: c}
-			c.descs = append(c.descs, d)
-			if u.Equal(attrClientCharacteristicConfigUUID) {
-				c.cccd = d
+			if int(h) < start || h > endh {
+				return nil, fmt.Errorf("invalid descriptor handle 0x%04x in range 0x%04x-0x%04x", h, start, endh)
 			}
+			d := &Descriptor{uuid: UUID{b[2:l]}, h: h, char: c}
+			descs = append(descs, d)
+			if d.uuid.Equal(attrClientCharacteristicConfigUUID) {
+				cccd = d
+			}
+			start = int(h) + 1
 			b = b[l:]
-			done = h == c.endh
-			start = h + 1
 		}
 	}
-	return c.descs, nil
+	if err := p.closedError(); err != nil {
+		return nil, err
+	}
+	if p.descriptorsDiscovered[c] {
+		if len(c.descs) != len(descs) {
+			return nil, p.databaseChanged("descriptors")
+		}
+		for i, d := range descs {
+			old := c.descs[i]
+			if old.h != d.h || !old.uuid.Equal(d.uuid) {
+				return nil, p.databaseChanged("descriptors")
+			}
+		}
+		return c.descs, nil
+	}
+	c.descs, c.cccd = descs, cccd
+	if p.descriptorsDiscovered == nil {
+		p.descriptorsDiscovered = make(map[*Characteristic]bool)
+	}
+	p.descriptorsDiscovered[c] = true
+	return descs, nil
 }
 
 func (p *peripheral) ReadCharacteristic(c *Characteristic) ([]byte, error) {
@@ -341,23 +442,12 @@ func (p *peripheral) WriteDescriptor(d *Descriptor, value []byte) error {
 
 func (p *peripheral) setNotifyValue(c *Characteristic, flag uint16,
 	f func(*Characteristic, []byte, error)) error {
+	if err := p.lockMetadata(); err != nil {
+		return err
+	}
+	defer p.unlockMetadata()
 	if c.cccd == nil {
 		return errors.New("no cccd") // FIXME
-	}
-	p.notifyOnce.Do(func() { p.notifyGate = make(chan struct{}, 1) })
-	if err := p.closedError(); err != nil {
-		return err
-	}
-	select {
-	case <-p.quitc:
-		return p.stopErr
-	case <-p.connectionDone():
-		return p.closedError()
-	case p.notifyGate <- struct{}{}:
-	}
-	defer func() { <-p.notifyGate }()
-	if err := p.closedError(); err != nil {
-		return err
 	}
 	ccc := uint16(0)
 	previous := p.sub.fn(c.vh)
@@ -400,15 +490,6 @@ func (p *peripheral) SetIndicateValue(c *Characteristic,
 func (p *peripheral) ReadRSSI() int {
 	// TODO: implement
 	return -1
-}
-
-func searchService(ss []*Service, start, end uint16) *Service {
-	for _, s := range ss {
-		if s.h < start && s.endh >= end {
-			return s
-		}
-	}
-	return nil
 }
 
 // TODO: unifiy the message with OS X pots and refactor

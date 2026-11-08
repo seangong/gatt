@@ -19,7 +19,7 @@ type Request struct {
 
 // Context is canceled when the connection or its device is closed. Handlers
 // should observe it when performing blocking work. Centrals without this
-// optional capability, including Darwin centrals, use context.Background.
+// optional capability use context.Background.
 func (r Request) Context() context.Context {
 	if c, ok := r.Central.(interface{ Context() context.Context }); ok {
 		return c.Context()

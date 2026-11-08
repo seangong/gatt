@@ -30,20 +30,45 @@ const ptr_to_uuid_t ptr_to_uuid(void *p) { return (ptr_to_uuid_t)p; }
 //
 // connect to XPC service
 //
-xpc_connection_t XpcConnect(char *service, void *ctx) {
-    dispatch_queue_t queue = dispatch_queue_create(service, 0);
+struct XpcContext {
+    uintptr_t handle;
+};
+
+static void XpcFinalize(void *value) {
+    struct XpcContext *ctx = value;
+    releaseXpcHandle(ctx->handle);
+    free(ctx);
+}
+
+bool XpcSetHandler(xpc_connection_t conn, uintptr_t handle) {
+    struct XpcContext *ctx = malloc(sizeof(*ctx));
+    if (ctx == NULL) {
+        return false;
+    }
+    ctx->handle = handle;
+    xpc_connection_set_context(conn, ctx);
+    xpc_connection_set_finalizer_f(conn, XpcFinalize);
+    xpc_connection_set_event_handler(conn, ^(xpc_object_t event) {
+        handleXpcEvent(event, ctx->handle);
+    });
+    return true;
+}
+
+xpc_connection_t XpcConnect(char *service, uintptr_t handle) {
+    dispatch_queue_t queue = dispatch_queue_create(service, DISPATCH_QUEUE_SERIAL);
     xpc_connection_t conn = xpc_connection_create_mach_service(service, queue, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED);
-
-    // making a local copy, that should be made "persistent" with the following Block_copy
-    GoInterface ictx = *((GoInterface*)ctx);
-
-    xpc_connection_set_event_handler(conn,
-        Block_copy(^(xpc_object_t event) {
-            handleXpcEvent(event, (void *)&ictx);
-        })
-    );
-
-    xpc_connection_resume(conn);
+    dispatch_release(queue);
+    if (conn == NULL) {
+        return NULL;
+    }
+    if (!XpcSetHandler(conn, handle)) {
+        // An inactive connection must be activated before it can be released.
+        xpc_connection_set_event_handler(conn, ^(xpc_object_t event) {});
+        xpc_connection_cancel(conn);
+        xpc_connection_resume(conn);
+        xpc_release(conn);
+        return NULL;
+    }
     return conn;
 }
 

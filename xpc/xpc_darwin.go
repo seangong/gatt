@@ -12,16 +12,107 @@ import (
 	"log"
 	r "reflect"
 	"runtime/cgo"
+	"sync"
 	"unsafe"
 )
 
+// XPC values share ownership of a connection. Call Close when it is no longer
+// needed; a Go finalizer cannot collect a handler retained by the native peer.
 type XPC struct {
-	conn C.xpc_connection_t
+	state *connectionState
 }
 
+type connectionState struct {
+	mu       sync.Mutex
+	conn     C.xpc_connection_t
+	err      error
+	done     chan struct{}
+	released chan struct{} // Closed only after the last native callback finishes.
+	handler  XpcEventHandler
+}
+
+// ErrClosed reports an explicitly closed or uninitialized connection.
+var ErrClosed = errors.New("xpc connection closed")
+
+// Send preserves the original fire-and-forget API. Use SendError to observe a
+// closed connection instead of silently discarding the send attempt.
 func (x *XPC) Send(msg interface{}, verbose bool) {
+	_ = x.SendError(msg, verbose)
+}
+
+// SendError enqueues a message or reports that the connection is closed. A nil
+// error means it was queued locally, not that the service has processed it.
+func (x *XPC) SendError(msg interface{}, verbose bool) error {
+	if x == nil || x.state == nil {
+		return ErrClosed
+	}
+	s := x.state
+	s.mu.Lock()
+	if s.err != nil {
+		err := s.err
+		s.mu.Unlock()
+		return err
+	}
+	conn := s.conn
+	C.xpc_retain(C.xpc_object_t(unsafe.Pointer(conn)))
+	s.mu.Unlock()
+	defer C.xpc_release(C.xpc_object_t(unsafe.Pointer(conn)))
 	// verbose == true converts the type from bool to C._Bool
-	C.XpcSendMessage(x.conn, goToXpc(msg), true, verbose == true)
+	C.XpcSendMessage(conn, goToXpc(msg), true, verbose == true)
+	return nil
+}
+
+// Close initiates asynchronous cancellation. It is safe to call from a handler
+// and does not wait for a running handler to return.
+func (x *XPC) Close() error {
+	if x != nil && x.state != nil {
+		x.state.close(ErrClosed, true)
+	}
+	return nil
+}
+
+// Done is closed as soon as cancellation starts or the connection is invalid.
+// It does not indicate that native callbacks and resource release have finished.
+func (x *XPC) Done() <-chan struct{} {
+	if x == nil || x.state == nil {
+		return closedConnection
+	}
+	return x.state.done
+}
+
+// Err returns the first terminal error, or nil while the connection is live.
+func (x *XPC) Err() error {
+	if x == nil || x.state == nil {
+		return ErrClosed
+	}
+	x.state.mu.Lock()
+	defer x.state.mu.Unlock()
+	return x.state.err
+}
+
+var closedConnection = func() <-chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
+
+func (s *connectionState) close(err error, cancel bool) {
+	s.mu.Lock()
+	if s.err != nil {
+		s.mu.Unlock()
+		return
+	}
+	s.err = err
+	conn := s.conn
+	s.conn = nil
+	close(s.done)
+	s.mu.Unlock()
+	if conn != nil {
+		if cancel {
+			C.xpc_connection_cancel(conn)
+		}
+		C.xpc_release(C.xpc_object_t(unsafe.Pointer(conn)))
+	}
 }
 
 //
@@ -128,22 +219,8 @@ func GetUUID(v interface{}) UUID {
 	}
 
 	if bytes, ok := v.([]byte); ok {
-		uuid := UUID{}
-
-		for i, b := range bytes {
-			uuid[i] = b
-		}
-
-		return uuid
-	}
-
-	if bytes, ok := v.([]uint8); ok {
-		uuid := UUID{}
-
-		for i, b := range bytes {
-			uuid[i] = b
-		}
-
+		uuid := make(UUID, len(bytes))
+		copy(uuid, bytes)
 		return uuid
 	}
 
@@ -164,42 +241,76 @@ type XpcEventHandler interface {
 	HandleXpcEvent(event Dict, err error)
 }
 
+// XpcConnect creates and activates a connection. Err reports creation failures;
+// subsequent events are asynchronous and can begin before this function returns.
 func XpcConnect(service string, eh XpcEventHandler) XPC {
+	s, handle := newConnectionState(eh)
 	cservice := C.CString(service)
 	defer C.free(unsafe.Pointer(cservice))
-	return XPC{conn: C.XpcConnect(cservice, unsafe.Pointer(&eh))}
+	return activateConnection(s, handle, C.XpcConnect(cservice, C.uintptr_t(handle)))
+}
+
+func newConnectionState(eh XpcEventHandler) (*connectionState, cgo.Handle) {
+	s := &connectionState{
+		done:     make(chan struct{}),
+		released: make(chan struct{}),
+		handler:  eh,
+	}
+	return s, cgo.NewHandle(s)
+}
+
+func activateConnection(s *connectionState, handle cgo.Handle, conn C.xpc_connection_t) XPC {
+	x := XPC{state: s}
+	if conn == nil {
+		s.close(fmt.Errorf("create xpc connection: %w", CONNECTION_INVALID), false)
+		handle.Delete() // Ownership was never handed to a native connection.
+		close(s.released)
+		return x
+	}
+	s.mu.Lock()
+	s.conn = conn
+	// Activation may immediately deliver INVALID. Keep the connection alive even
+	// if that callback releases the state's main reference before resume returns.
+	C.xpc_retain(C.xpc_object_t(unsafe.Pointer(conn)))
+	s.mu.Unlock()
+	C.xpc_connection_resume(conn)
+	C.xpc_release(C.xpc_object_t(unsafe.Pointer(conn)))
+	return x
 }
 
 //export handleXpcEvent
-func handleXpcEvent(event C.xpc_object_t, p unsafe.Pointer) {
-	//log.Printf("handleXpcEvent %#v %#v\n", event, p)
-
+func handleXpcEvent(event C.xpc_object_t, token C.uintptr_t) {
+	s := cgo.Handle(token).Value().(*connectionState)
 	t := C.xpc_get_type(event)
-	eh := *((*XpcEventHandler)(p))
-
+	var err error
 	if t == C.TYPE_ERROR {
 		if event == C.ERROR_CONNECTION_INVALID {
-			// The client process on the other end of the connection has either
-			// crashed or cancelled the connection. After receiving this error,
-			// the connection is in an invalid state, and you do not need to
-			// call xpc_connection_cancel(). Just tear down any associated state
-			// here.
-			//log.Println("connection invalid")
-			eh.HandleXpcEvent(nil, CONNECTION_INVALID)
+			err = CONNECTION_INVALID
+			s.close(err, false)
 		} else if event == C.ERROR_CONNECTION_INTERRUPTED {
-			//log.Println("connection interrupted")
-			eh.HandleXpcEvent(nil, CONNECTION_INTERRUPTED)
+			err = CONNECTION_INTERRUPTED
 		} else if event == C.ERROR_CONNECTION_TERMINATED {
-			// Handle per-connection termination cleanup.
-			//log.Println("connection terminated")
-			eh.HandleXpcEvent(nil, CONNECTION_TERMINATED)
+			err = CONNECTION_TERMINATED
+			s.close(err, true)
 		} else {
-			//log.Println("got some error", event)
-			eh.HandleXpcEvent(nil, fmt.Errorf("%v", event))
+			err = fmt.Errorf("%v", event)
 		}
-	} else {
-		eh.HandleXpcEvent(xpcToGo(event).(Dict), nil)
+		if s.handler != nil {
+			s.handler.HandleXpcEvent(nil, err)
+		}
+		return
 	}
+	if s.handler != nil {
+		s.handler.HandleXpcEvent(xpcToGo(event).(Dict), nil)
+	}
+}
+
+//export releaseXpcHandle
+func releaseXpcHandle(token C.uintptr_t) {
+	handle := cgo.Handle(token)
+	s := handle.Value().(*connectionState)
+	handle.Delete()
+	close(s.released)
 }
 
 // goToXpc converts a go object to an xpc object

@@ -1,8 +1,9 @@
 package gatt
 
 import (
+	"context"
 	"errors"
-	"log"
+	"io"
 
 	"github.com/seangong/gatt/v2/xpc"
 )
@@ -23,9 +24,9 @@ type peripheral struct {
 	id   xpc.UUID
 	name string
 
-	reqc  chan message
-	rspc  chan message
-	quitc chan struct{}
+	ctx      context.Context
+	cancel   context.CancelCauseFunc
+	requests xpcRequests
 }
 
 func NewPeripheral(u UUID) Peripheral { return &peripheral{id: xpc.UUID(u.b)} }
@@ -36,10 +37,13 @@ func (p *peripheral) Name() string         { return p.name }
 func (p *peripheral) Services() []*Service { return p.svcs }
 
 func (p *peripheral) DiscoverServices(ss []UUID) ([]*Service, error) {
-	rsp := p.sendReq(45, xpc.Dict{
+	rsp, err := p.sendReq(45, xpc.Dict{
 		"kCBMsgArgDeviceUUID": p.id,
 		"kCBMsgArgUUIDs":      uuidSlice(ss),
 	})
+	if err != nil {
+		return nil, err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return nil, attEcode(res)
 	}
@@ -56,12 +60,15 @@ func (p *peripheral) DiscoverServices(ss []UUID) ([]*Service, error) {
 }
 
 func (p *peripheral) DiscoverIncludedServices(ss []UUID, s *Service) ([]*Service, error) {
-	rsp := p.sendReq(60, xpc.Dict{
+	rsp, err := p.sendReq(60, xpc.Dict{
 		"kCBMsgArgDeviceUUID":         p.id,
 		"kCBMsgArgServiceStartHandle": s.h,
 		"kCBMsgArgServiceEndHandle":   s.endh,
 		"kCBMsgArgUUIDs":              uuidSlice(ss),
 	})
+	if err != nil {
+		return nil, err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return nil, attEcode(res)
 	}
@@ -70,12 +77,15 @@ func (p *peripheral) DiscoverIncludedServices(ss []UUID, s *Service) ([]*Service
 }
 
 func (p *peripheral) DiscoverCharacteristics(cs []UUID, s *Service) ([]*Characteristic, error) {
-	rsp := p.sendReq(62, xpc.Dict{
+	rsp, err := p.sendReq(62, xpc.Dict{
 		"kCBMsgArgDeviceUUID":         p.id,
 		"kCBMsgArgServiceStartHandle": s.h,
 		"kCBMsgArgServiceEndHandle":   s.endh,
 		"kCBMsgArgUUIDs":              uuidSlice(cs),
 	})
+	if err != nil {
+		return nil, err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return nil, attEcode(res)
 	}
@@ -92,12 +102,15 @@ func (p *peripheral) DiscoverCharacteristics(cs []UUID, s *Service) ([]*Characte
 }
 
 func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descriptor, error) {
-	rsp := p.sendReq(70, xpc.Dict{
+	rsp, err := p.sendReq(70, xpc.Dict{
 		"kCBMsgArgDeviceUUID":                p.id,
 		"kCBMsgArgCharacteristicHandle":      c.h,
 		"kCBMsgArgCharacteristicValueHandle": c.vh,
 		"kCBMsgArgUUIDs":                     uuidSlice(ds),
 	})
+	if err != nil {
+		return nil, err
+	}
 	for _, xds := range rsp.MustGetArray("kCBMsgArgDescriptors") {
 		xd := xds.(xpc.Dict)
 		u := MustParseUUID(xd.MustGetHexBytes("kCBMsgArgUUID"))
@@ -109,11 +122,14 @@ func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descr
 }
 
 func (p *peripheral) ReadCharacteristic(c *Characteristic) ([]byte, error) {
-	rsp := p.sendReq(65, xpc.Dict{
+	rsp, err := p.sendReq(65, xpc.Dict{
 		"kCBMsgArgDeviceUUID":                p.id,
 		"kCBMsgArgCharacteristicHandle":      c.h,
 		"kCBMsgArgCharacteristicValueHandle": c.vh,
 	})
+	if err != nil {
+		return nil, err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return nil, attEcode(res)
 	}
@@ -134,10 +150,12 @@ func (p *peripheral) WriteCharacteristic(c *Characteristic, b []byte, noRsp bool
 		"kCBMsgArgType":                      map[bool]int{false: 0, true: 1}[noRsp],
 	}
 	if noRsp {
-		p.sendCmd(66, args)
-		return nil
+		return p.sendCmd(66, args)
 	}
-	rsp := p.sendReq(65, args)
+	rsp, err := p.sendReq(66, args)
+	if err != nil {
+		return err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return attEcode(res)
 	}
@@ -145,10 +163,13 @@ func (p *peripheral) WriteCharacteristic(c *Characteristic, b []byte, noRsp bool
 }
 
 func (p *peripheral) ReadDescriptor(d *Descriptor) ([]byte, error) {
-	rsp := p.sendReq(77, xpc.Dict{
+	rsp, err := p.sendReq(77, xpc.Dict{
 		"kCBMsgArgDeviceUUID":       p.id,
 		"kCBMsgArgDescriptorHandle": d.h,
 	})
+	if err != nil {
+		return nil, err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return nil, attEcode(res)
 	}
@@ -157,11 +178,14 @@ func (p *peripheral) ReadDescriptor(d *Descriptor) ([]byte, error) {
 }
 
 func (p *peripheral) WriteDescriptor(d *Descriptor, b []byte) error {
-	rsp := p.sendReq(78, xpc.Dict{
+	rsp, err := p.sendReq(78, xpc.Dict{
 		"kCBMsgArgDeviceUUID":       p.id,
 		"kCBMsgArgDescriptorHandle": d.h,
 		"kCBMsgArgData":             b,
 	})
+	if err != nil {
+		return err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return attEcode(res)
 	}
@@ -169,6 +193,10 @@ func (p *peripheral) WriteDescriptor(d *Descriptor, b []byte) error {
 }
 
 func (p *peripheral) SetNotifyValue(c *Characteristic, f func(*Characteristic, []byte, error)) error {
+	if err := context.Cause(p.context()); err != nil {
+		return err
+	}
+	previous := p.sub.fn(c.h)
 	set := 1
 	if f == nil {
 		set = 0
@@ -178,12 +206,22 @@ func (p *peripheral) SetNotifyValue(c *Characteristic, f func(*Characteristic, [
 		// Note: when notified, core bluetooth reports characteristic handle, not value's handle.
 		p.sub.subscribe(c.h, func(b []byte, err error) { f(c, b, err) })
 	}
-	rsp := p.sendReq(68, xpc.Dict{
+	rsp, err := p.sendReq(68, xpc.Dict{
 		"kCBMsgArgDeviceUUID":                p.id,
 		"kCBMsgArgCharacteristicHandle":      c.h,
 		"kCBMsgArgCharacteristicValueHandle": c.vh,
 		"kCBMsgArgState":                     set,
 	})
+	if err != nil {
+		if f != nil {
+			if previous == nil {
+				p.sub.unsubscribe(c.h)
+			} else {
+				p.sub.subscribe(c.h, previous)
+			}
+		}
+		return err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return attEcode(res)
 	}
@@ -201,7 +239,10 @@ func (p *peripheral) SetIndicateValue(c *Characteristic,
 }
 
 func (p *peripheral) ReadRSSI() int {
-	rsp := p.sendReq(43, xpc.Dict{"kCBMsgArgDeviceUUID": p.id})
+	rsp, err := p.sendReq(43, xpc.Dict{"kCBMsgArgDeviceUUID": p.id})
+	if err != nil {
+		return -1
+	}
 	return rsp.MustGetInt("kCBMsgArgData")
 }
 
@@ -217,61 +258,58 @@ func uuidSlice(uu []UUID) [][]byte {
 	return us
 }
 
-type message struct {
-	id   int
-	args xpc.Dict
-	rspc chan xpc.Dict
-}
-
-func (p *peripheral) sendCmd(id int, args xpc.Dict) {
-	p.reqc <- message{id: id, args: args}
-}
-
-func (p *peripheral) sendReq(id int, args xpc.Dict) xpc.Dict {
-	m := message{id: id, args: args, rspc: make(chan xpc.Dict)}
-	p.reqc <- m
-	return <-m.rspc
-}
-
-func (p *peripheral) loop() {
-	rspc := make(chan message)
-
-	go func() {
-		for {
-			select {
-			case req := <-p.reqc:
-				p.d.sendCBMsg(req.id, req.args)
-				if req.rspc == nil {
-					break
-				}
-				m := <-rspc
-				req.rspc <- m.args
-			case <-p.quitc:
-				return
-			}
-		}
-	}()
-
-	for {
-		select {
-		case rsp := <-p.rspc:
-			// Notification
-			if rsp.id == 71 && rsp.args.GetInt("kCBMsgArgIsNotification", 0) != 0 {
-				// While we're notified with the value's handle, blued reports the characteristic handle.
-				ch := uint16(rsp.args.MustGetInt("kCBMsgArgCharacteristicHandle"))
-				b := rsp.args.MustGetBytes("kCBMsgArgData")
-				f := p.sub.fn(ch)
-				if f == nil {
-					log.Printf("notified by unsubscribed handle")
-					// FIXME: should terminate the connection?
-				} else {
-					go f(b, nil)
-				}
-				break
-			}
-			rspc <- rsp
-		case <-p.quitc:
-			return
-		}
+func (p *peripheral) stop(err error) {
+	if p.cancel != nil {
+		p.cancel(err)
 	}
+}
+
+func (p *peripheral) context() context.Context {
+	if p.ctx != nil {
+		return p.ctx
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(io.ErrClosedPipe)
+	return ctx
+}
+
+func (p *peripheral) sendCmd(id int, args xpc.Dict) error {
+	if err := context.Cause(p.context()); err != nil {
+		return err
+	}
+	return p.d.sendCBMsg(id, args)
+}
+
+func (p *peripheral) sendReq(id int, args xpc.Dict) (xpc.Dict, error) {
+	responseIDs := map[int]int{
+		43: rssiRead,
+		45: serviceDiscovered,
+		60: includedServicesDiscovered,
+		62: characteristicsDiscovered,
+		65: characteristicRead,
+		66: characteristicWritten,
+		68: notificationValueSet,
+		70: descriptorsDiscovered,
+		77: descriptorRead,
+		78: descriptorWritten,
+	}
+	return p.requests.request(p.context(), responseIDs[id], func() error {
+		return p.d.sendCBMsg(id, args)
+	})
+}
+
+func (p *peripheral) handleResponse(id int, args xpc.Dict) {
+	if context.Cause(p.context()) != nil {
+		return
+	}
+	if id == characteristicRead && args.GetInt("kCBMsgArgIsNotification", 0) != 0 {
+		// While we're notified with the value's handle, blued reports the characteristic handle.
+		ch := uint16(args.MustGetInt("kCBMsgArgCharacteristicHandle"))
+		b := args.MustGetBytes("kCBMsgArgData")
+		if f := p.sub.fn(ch); f != nil {
+			go f(b, nil)
+		}
+		return
+	}
+	p.requests.deliver(id, args)
 }

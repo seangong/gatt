@@ -19,7 +19,8 @@ extern xpc_object_t ERROR_CONNECTION_INVALID;
 extern xpc_object_t ERROR_CONNECTION_INTERRUPTED;
 extern xpc_object_t ERROR_CONNECTION_TERMINATED;
 
-extern xpc_connection_t XpcConnect(char *, void *);
+extern xpc_connection_t XpcConnect(char *, uintptr_t);
+extern bool XpcSetHandler(xpc_connection_t, uintptr_t);
 extern void XpcSendMessage(xpc_connection_t, xpc_object_t, bool, bool);
 extern void XpcArrayApply(uintptr_t, xpc_object_t);
 extern void XpcDictApply(uintptr_t, xpc_object_t);

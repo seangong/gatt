@@ -70,7 +70,9 @@ func NewDevice(opts ...Option) (Device, error) {
 		},
 	}
 
-	d.Option(opts...)
+	if err := d.Option(opts...); err != nil {
+		return nil, err
+	}
 	h, err := linux.NewHCI(d.devID, d.chkLE, d.maxConn)
 	if err != nil {
 		return nil, err

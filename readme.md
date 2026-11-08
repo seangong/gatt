@@ -84,6 +84,11 @@ implementation or the subsequent Linux fixes.
 import "github.com/seangong/gatt/v2"
 ```
 
+`NewDevice` and `Device.Option` apply options in order and stop at the first
+error. Already applied options are not rolled back. `NewDevice` returns an
+option error before opening the HCI or XPC connection; wrapped errors remain
+identifiable with `errors.Is` and `errors.As`.
+
 ## Linux setup
 
 Use a kernel with HCI user-channel support, introduced in Linux 3.14, and a
@@ -137,6 +142,47 @@ server role through the macOS options shown in
 [`examples/option/option_darwin.go`](examples/option/option_darwin.go).
 The legacy XPC backend needs separate verification on your macOS release; the
 Linux lifecycle and interoperability results do not apply to it automatically.
+
+macOS devices expose an optional `Close() error` method outside the portable
+`Device` interface. After a successful macOS `NewDevice`, use it at shutdown:
+
+```go
+if err := d.(interface{ Close() error }).Close(); err != nil {
+	return err
+}
+```
+
+`Close` is safe to repeat. It starts XPC cancellation and releases library
+request waiters, without waiting for the native finalizer or application
+callbacks to finish. Handlers should observe `Request.Context()` and
+`Notifier.Done()` so they can exit on cancellation. A blocked handler that
+ignores cancellation can delay native connection and handler-token release.
+This is a different shutdown contract from Linux `StopContext`.
+
+An XPC interruption ends the current GATT device session and cancels its pending
+requests. macOS devices also expose optional `Done() <-chan struct{}` and
+`Err() error` methods. Observe them when waiting for asynchronous operations
+such as scanning, which have no error return:
+
+```go
+session := d.(interface {
+	Done() <-chan struct{}
+	Err() error
+})
+d.Scan(nil, false)
+<-session.Done()
+return session.Err()
+```
+
+`Err` is nil while the session is live. Once `Done` closes, `Err` reports the
+first termination cause; later errors and repeated `Close` calls do not replace
+it. Observers can subscribe before or after termination. `Done` closes on
+explicit `Close` as well, and signals that the session is unavailable, not that
+connection cleanup or native resource release has finished. Existing state
+callbacks continue to report Bluetooth state changes.
+
+Business writes are not automatically replayed. Create a new device with
+`NewDevice` and reinitialize application state before continuing.
 
 ## Minimal Linux server
 
@@ -286,6 +332,14 @@ Handlers should observe `Request.Context()` when doing blocking work.
 Notification handlers should also check `Notifier.Done()` when unsubscribed.
 A transport write already in progress may finish after `Done()` becomes true.
 
+Linux client discovery publishes its cache only after a complete successful
+discovery. Repeating discovery with the same attribute layout reuses the
+existing objects, CCCD and subscriptions. A failed or incomplete discovery
+leaves the previous cache intact. If a later complete discovery finds a changed
+layout, it returns an error matching `errors.Is(err, gatt.ErrDatabaseChanged)`
+and closes that connection. Reconnect and rediscover before using attribute
+handles again. Discovery UUID filters remain unimplemented as listed above.
+
 ## Linux shutdown and reopening
 
 Linux devices expose optional `StopContext(context.Context) error` and
@@ -408,9 +462,18 @@ go vet ./...
 ```
 
 The macOS XPC conversion tests exercise synchronous value conversion without
-connecting to the Bluetooth service. They do not validate the legacy backend's
-connection or event lifecycle. Keep controller/peer interoperability testing
-separate from unit tests; record the hardware, firmware, role and negotiated MTU.
+connecting to the Bluetooth service. Run the controlled native connection and
+callback-lifecycle tests separately:
+
+```sh
+go test -race -tags gattxpc_test . ./xpc
+GOEXPERIMENT=cgocheck2 go test -tags gattxpc_test . ./xpc
+```
+
+These tests use local XPC connections; they do not establish compatibility with
+the private `com.apple.blued` interface on a particular macOS release. Keep
+controller/peer interoperability testing separate from unit tests; record the
+hardware, firmware, role and negotiated MTU.
 
 ## Background and license
 

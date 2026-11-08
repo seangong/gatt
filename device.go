@@ -1,6 +1,9 @@
 package gatt
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var notImplemented = errors.New("not implemented")
 
@@ -149,10 +152,12 @@ type Option func(Device) error
 
 // Option sets the options specified.
 // Some options can only be set before the device is initialized; they are best used with NewDevice instead of Option.
+// It stops at the first error; options already applied are not rolled back.
 func (d *device) Option(opts ...Option) error {
-	var err error
-	for _, opt := range opts {
-		err = opt(d)
+	for i, opt := range opts {
+		if err := opt(d); err != nil {
+			return fmt.Errorf("apply option %d: %w", i+1, err)
+		}
 	}
-	return err
+	return nil
 }

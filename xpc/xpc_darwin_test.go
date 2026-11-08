@@ -147,3 +147,25 @@ func TestConvertContainers(t *testing.T) {
 		})
 	}
 }
+
+func TestGetUUIDBytes(t *testing.T) {
+	for _, input := range [][]byte{nil, {}, {1}, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}} {
+		got := GetUUID(input)
+		if got == nil || !bytes.Equal(got, input) {
+			t.Fatalf("GetUUID(%v) = %v", input, got)
+		}
+		if len(input) != 0 {
+			input[0] ^= 0xff
+			if got[0] == input[0] {
+				t.Fatal("GetUUID returned a slice aliasing its []byte input")
+			}
+		}
+	}
+	if got := GetUUID(nil); got == nil || len(got) != 0 {
+		t.Fatalf("GetUUID(nil) = %#v", got)
+	}
+	uuid := UUID{1, 2, 3}
+	if got := GetUUID(uuid); &got[0] != &uuid[0] {
+		t.Fatal("GetUUID changed existing UUID identity")
+	}
+}

@@ -2,9 +2,11 @@ package gatt
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -36,8 +38,11 @@ type device struct {
 
 	role int // 1: peripheralManager (server), 0: centralManager (client)
 
-	reqc chan message
-	rspc chan message
+	ctx      context.Context
+	cancel   context.CancelCauseFunc
+	ready    chan struct{}
+	requests xpcRequests
+	stateMu  sync.Mutex
 
 	// Only used in client/centralManager implementation
 	plist   map[string]*peripheral
@@ -45,16 +50,16 @@ type device struct {
 
 	// Only used in server/peripheralManager implementation
 
-	attrN int
-	attrs map[int]*attr
+	attrN  int
+	attrs  map[int]*attr
+	attrmu sync.RWMutex
 
-	subscribers map[string]*central
+	subscribers   map[string]*central
+	subscribersmu sync.Mutex
 }
 
 func NewDevice(opts ...Option) (Device, error) {
 	d := &device{
-		reqc:    make(chan message),
-		rspc:    make(chan message),
 		plist:   map[string]*peripheral{},
 		plistmu: &sync.Mutex{},
 
@@ -63,20 +68,35 @@ func NewDevice(opts ...Option) (Device, error) {
 
 		subscribers: make(map[string]*central),
 	}
-	d.Option(opts...)
+	if err := d.Option(opts...); err != nil {
+		return nil, err
+	}
+	d.ctx, d.cancel = context.WithCancelCause(context.Background())
+	d.ready = make(chan struct{})
 	d.conn = xpc.XpcConnect("com.apple.blued", d)
+	close(d.ready)
+	if err := d.conn.Err(); err != nil {
+		d.fail(err)
+		return nil, err
+	}
 	return d, nil
 }
 
 func (d *device) Init(f func(Device, State)) error {
-	go d.loop()
-	rsp := d.sendReq(1, xpc.Dict{
+	d.stateMu.Lock()
+	d.stateChanged = f
+	d.stateMu.Unlock()
+	rsp, err := d.sendReq(1, xpc.Dict{
 		"kCBMsgArgName":    fmt.Sprintf("gopher-%v", time.Now().Unix()),
 		"kCBMsgArgOptions": xpc.Dict{"kCBInitOptionShowPowerAlert": 1},
 		"kCBMsgArgType":    d.role,
 	})
-	d.stateChanged = f
-	go d.stateChanged(d, State(rsp.MustGetInt("kCBMsgArgState")))
+	if err != nil {
+		return err
+	}
+	if f != nil {
+		go f(d, State(rsp.MustGetInt("kCBMsgArgState")))
+	}
 	return nil
 }
 
@@ -84,10 +104,13 @@ func (d *device) Advertise(a *AdvPacket) error {
 	if err := a.Err(); err != nil {
 		return err
 	}
-	rsp := d.sendReq(8, xpc.Dict{
+	rsp, err := d.sendReq(8, xpc.Dict{
 		"kCBAdvDataAppleMfgData": a.b, // not a.Bytes(). should be slice
 	})
 
+	if err != nil {
+		return err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return errors.New("FIXME: Advertise error")
 	}
@@ -96,10 +119,13 @@ func (d *device) Advertise(a *AdvPacket) error {
 
 func (d *device) AdvertiseNameAndServices(name string, ss []UUID) error {
 	us := uuidSlice(ss)
-	rsp := d.sendReq(8, xpc.Dict{
+	rsp, err := d.sendReq(8, xpc.Dict{
 		"kCBAdvDataLocalName":    name,
 		"kCBAdvDataServiceUUIDs": us},
 	)
+	if err != nil {
+		return err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return errors.New("FIXME: Advertise error")
 	}
@@ -111,16 +137,20 @@ func (d *device) AdvertiseIBeaconData(data []byte) error {
 	xpc.Uname(&utsname)
 
 	var rsp xpc.Dict
+	var err error
 
 	if utsname.Release >= "14." {
 		l := len(data)
 		buf := bytes.NewBuffer([]byte{byte(l + 5), 0xFF, 0x4C, 0x00, 0x02, byte(l)})
 		buf.Write(data)
-		rsp = d.sendReq(8, xpc.Dict{"kCBAdvDataAppleMfgData": buf.Bytes()})
+		rsp, err = d.sendReq(8, xpc.Dict{"kCBAdvDataAppleMfgData": buf.Bytes()})
 	} else {
-		rsp = d.sendReq(8, xpc.Dict{"kCBAdvDataAppleBeaconKey": data})
+		rsp, err = d.sendReq(8, xpc.Dict{"kCBAdvDataAppleBeaconKey": data})
 	}
 
+	if err != nil {
+		return err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return errors.New("FIXME: Advertise error")
 	}
@@ -138,7 +168,10 @@ func (d *device) AdvertiseIBeacon(u UUID, major, minor uint16, pwr int8) error {
 }
 
 func (d *device) StopAdvertising() error {
-	rsp := d.sendReq(9, nil)
+	rsp, err := d.sendReq(9, nil)
+	if err != nil {
+		return err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return errors.New("FIXME: Stop Advertise error")
 	}
@@ -146,16 +179,19 @@ func (d *device) StopAdvertising() error {
 }
 
 func (d *device) RemoveAllServices() error {
-	d.sendCmd(12, nil)
-	return nil
+	return d.sendCmd(12, nil)
 }
 
 func (d *device) AddService(s *Service) error {
+	if err := context.Cause(d.ctx); err != nil {
+		return err
+	}
 	if s.uuid.Equal(attrGAPUUID) || s.uuid.Equal(attrGATTUUID) {
 		// skip GATT and GAP services
 		return nil
 	}
 
+	d.attrmu.Lock()
 	xs := xpc.Dict{
 		"kCBMsgArgAttributeID":     d.attrN,
 		"kCBMsgArgAttributeIDs":    []int{},
@@ -235,7 +271,11 @@ func (d *device) AddService(s *Service) error {
 	}
 	xs["kCBMsgArgCharacteristics"] = xcs
 
-	rsp := d.sendReq(10, xs)
+	d.attrmu.Unlock()
+	rsp, err := d.sendReq(10, xs)
+	if err != nil {
+		return err
+	}
 	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
 		return errors.New("FIXME: Add Srvice error")
 	}
@@ -243,9 +283,13 @@ func (d *device) AddService(s *Service) error {
 }
 
 func (d *device) SetServices(ss []*Service) error {
-	d.RemoveAllServices()
+	if err := d.RemoveAllServices(); err != nil {
+		return err
+	}
 	for _, s := range ss {
-		d.AddService(s)
+		if err := d.AddService(s); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -266,7 +310,16 @@ func (d *device) StopScanning() {
 
 func (d *device) Connect(p Peripheral) {
 	pp := p.(*peripheral)
+	d.plistmu.Lock()
+	if err := context.Cause(d.ctx); err != nil {
+		d.plistmu.Unlock()
+		if d.peripheralConnected != nil {
+			go d.peripheralConnected(p, err)
+		}
+		return
+	}
 	d.plist[pp.id.String()] = pp
+	d.plistmu.Unlock()
 	d.sendCmd(31,
 		xpc.Dict{
 			"kCBMsgArgDeviceUUID": pp.id,
@@ -285,7 +338,12 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 		a := args.MustGetInt("kCBMsgArgAttributeID")
 		o := args.MustGetInt("kCBMsgArgOffset")
 
+		d.attrmu.RLock()
 		attr := d.attrs[a]
+		d.attrmu.RUnlock()
+		if attr == nil {
+			return
+		}
 		v := attr.value
 		if v == nil {
 			c := newCentral(d, u)
@@ -323,7 +381,12 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 			i := xw.MustGetInt("kCBMsgArgIgnoreResponse")
 			b := xw.MustGetBytes("kCBMsgArgData")
 			_ = o
+			d.attrmu.RLock()
 			attr := d.attrs[a]
+			d.attrmu.RUnlock()
+			if attr == nil {
+				return
+			}
 			c := newCentral(d, u)
 			r := Request{Central: c}
 			attr.pvt.(*Characteristic).whandler.ServeWrite(r, b)
@@ -345,16 +408,34 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 	case 21: // subscribed
 		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
 		a := args.MustGetInt("kCBMsgArgAttributeID")
+		d.attrmu.RLock()
 		attr := d.attrs[a]
-		c := newCentral(d, u)
-		d.subscribers[u.String()] = c
+		d.attrmu.RUnlock()
+		if attr == nil {
+			return
+		}
+		d.subscribersmu.Lock()
+		c := d.subscribers[u.String()]
+		if c == nil {
+			c = newCentral(d, u)
+			d.subscribers[u.String()] = c
+		}
+		d.subscribersmu.Unlock()
 		c.startNotify(attr, c.mtu)
 
 	case 22: // unubscribed
 		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
 		a := args.MustGetInt("kCBMsgArgAttributeID")
+		d.attrmu.RLock()
 		attr := d.attrs[a]
-		if c := d.subscribers[u.String()]; c != nil {
+		d.attrmu.RUnlock()
+		if attr == nil {
+			return
+		}
+		d.subscribersmu.Lock()
+		c := d.subscribers[u.String()]
+		d.subscribersmu.Unlock()
+		if c != nil {
 			c.stopNotify(attr)
 		}
 
@@ -369,8 +450,12 @@ func (d *device) CancelConnection(p Peripheral) {
 // process device events and asynchronous errors
 // (implements XpcEventHandler)
 func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
+	<-d.ready
 	if err != nil {
-		log.Println("error:", err)
+		d.fail(err)
+		return
+	}
+	if context.Cause(d.ctx) != nil {
 		return
 	}
 
@@ -384,7 +469,14 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 		16, // AdvertisingStarted
 		17, // AdvertisingStopped
 		18: // ServiceAdded
-		d.rspc <- message{id: id, args: args}
+		if !d.requests.deliver(id, args) && id == 6 {
+			d.stateMu.Lock()
+			f := d.stateChanged
+			d.stateMu.Unlock()
+			if f != nil {
+				go f(d, State(args.MustGetInt("kCBMsgArgState")))
+			}
+		}
 
 	case
 		19, // ReadRequest
@@ -431,17 +523,19 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 	case peripheralConnected:
 		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
 		p := &peripheral{
-			id:    xpc.UUID(u.b),
-			d:     d,
-			reqc:  make(chan message),
-			rspc:  make(chan message),
-			quitc: make(chan struct{}),
-			sub:   newSubscriber(),
+			id:  xpc.UUID(u.b),
+			d:   d,
+			sub: newSubscriber(),
 		}
+		p.ctx, p.cancel = context.WithCancelCause(d.ctx)
 		d.plistmu.Lock()
-		d.plist[u.String()] = p
+		if err := context.Cause(d.ctx); err != nil {
+			d.plistmu.Unlock()
+			p.stop(err)
+			return
+		}
+		d.plist[xpc.UUID(u.b).String()] = p
 		d.plistmu.Unlock()
-		go p.loop()
 
 		if d.peripheralConnected != nil {
 			go d.peripheralConnected(p, nil)
@@ -450,13 +544,16 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 	case peripheralDisconnected:
 		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
 		d.plistmu.Lock()
-		p := d.plist[u.String()]
-		delete(d.plist, u.String())
+		p := d.plist[xpc.UUID(u.b).String()]
+		delete(d.plist, xpc.UUID(u.b).String())
 		d.plistmu.Unlock()
-		if d.peripheralDisconnected != nil {
-			d.peripheralDisconnected(p, nil) // TODO: Get Result as error?
+		if p == nil {
+			return
 		}
-		close(p.quitc)
+		p.stop(io.ErrClosedPipe)
+		if d.peripheralDisconnected != nil {
+			go d.peripheralDisconnected(p, nil) // TODO: Get Result as error?
+		}
 
 	case // Peripheral events
 		rssiRead,
@@ -472,37 +569,84 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 
 		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
 		d.plistmu.Lock()
-		p := d.plist[u.String()]
+		p := d.plist[xpc.UUID(u.b).String()]
 		d.plistmu.Unlock()
-		p.rspc <- message{id: id, args: args}
+		if p != nil {
+			p.handleResponse(id, args)
+		}
 
 	default:
 		log.Printf("Unhandled event: %#v", event)
 	}
 }
 
-func (d *device) sendReq(id int, args xpc.Dict) xpc.Dict {
-	m := message{id: id, args: args, rspc: make(chan xpc.Dict)}
-	d.reqc <- m
-	return <-m.rspc
+// Done is closed when this macOS device session starts terminating, including
+// on Close or an asynchronous XPC error. It does not wait for application
+// callbacks, connection cleanup, or the native finalizer to finish.
+// This method is an optional capability outside the portable Device interface.
+func (d *device) Done() <-chan struct{} { return d.ctx.Done() }
+
+// Err returns the first session termination cause, or nil while the session is
+// live. After Done is closed, Err is non-nil and remains unchanged.
+// This method is an optional capability outside the portable Device interface.
+func (d *device) Err() error { return context.Cause(d.ctx) }
+
+// Close starts cancellation without waiting for application callbacks. The
+// native connection retains its handler until its final callback has finished.
+func (d *device) Close() error {
+	d.fail(xpc.ErrClosed)
+	return nil
 }
 
-func (d *device) sendCmd(id int, args xpc.Dict) {
-	d.reqc <- message{id: id, args: args}
-}
-
-func (d *device) loop() {
-	for req := range d.reqc {
-		d.sendCBMsg(req.id, req.args)
-		if req.rspc == nil {
-			continue
-		}
-		m := <-d.rspc
-		req.rspc <- m.args
+func (d *device) fail(err error) {
+	if err == nil {
+		err = io.ErrClosedPipe
 	}
+	d.cancel(err)
+	err = context.Cause(d.ctx)
+	// Cancel native delivery even if a user callback is currently blocked.
+	_ = d.conn.Close()
+
+	d.plistmu.Lock()
+	peripherals := d.plist
+	d.plist = make(map[string]*peripheral)
+	d.plistmu.Unlock()
+	for _, p := range peripherals {
+		p.stop(err)
+		if p.cancel == nil {
+			if d.peripheralConnected != nil {
+				go d.peripheralConnected(p, err)
+			}
+		} else if d.peripheralDisconnected != nil {
+			go d.peripheralDisconnected(p, err)
+		}
+	}
+	d.subscribersmu.Lock()
+	for _, c := range d.subscribers {
+		c.stopNotifiers()
+	}
+	d.subscribersmu.Unlock()
 }
 
-func (d *device) sendCBMsg(id int, args xpc.Dict) {
+func (d *device) sendReq(id int, args xpc.Dict) (xpc.Dict, error) {
+	responseIDs := map[int]int{1: 6, 8: 16, 9: 17, 10: 18}
+	return d.requests.request(d.ctx, responseIDs[id], func() error {
+		return d.sendCBMsg(id, args)
+	})
+}
+
+func (d *device) sendCmd(id int, args xpc.Dict) error {
+	return d.sendCBMsg(id, args)
+}
+
+func (d *device) sendCBMsg(id int, args xpc.Dict) error {
+	if err := context.Cause(d.ctx); err != nil {
+		return err
+	}
 	// log.Printf("<< %d, %v", id, args)
-	d.conn.Send(xpc.Dict{"kCBMsgId": id, "kCBMsgArgs": args}, false)
+	if err := d.conn.SendError(xpc.Dict{"kCBMsgId": id, "kCBMsgArgs": args}, false); err != nil {
+		d.fail(err)
+		return context.Cause(d.ctx)
+	}
+	return nil
 }
