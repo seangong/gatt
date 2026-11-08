@@ -44,6 +44,10 @@ func (d *flowTestDevice) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+func (d *flowTestDevice) writeACL(b []byte, submit aclSubmitFunc) (int, error) {
+	return submit(func() (int, error) { return d.Write(b) })
+}
+
 func (d *flowTestDevice) Close() error {
 	d.closeOnce.Do(func() { close(d.done) })
 	return nil

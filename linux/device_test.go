@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"reflect"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -228,5 +230,103 @@ func TestDeviceInitializationFailureClosesFD(t *testing.T) {
 	var stat syscall.Stat_t
 	if err := syscall.Fstat(fd, &stat); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("failed transport left its fd open: Fstat error = %v", err)
+	}
+}
+
+func TestSelectDeviceUsesReturnedIDs(t *testing.T) {
+	for _, ids := range [][]uint16{{7}, {2, 7}} {
+		var req devListRequest
+		req.devNum = uint16(len(ids))
+		for i, id := range ids {
+			req.devRequest[i].id = id
+		}
+		var probed []int
+		id, name, err := selectDevice(req, func(id int) (string, error) {
+			probed = append(probed, id)
+			if id != 7 {
+				return "", syscall.ENODEV
+			}
+			return "hci7", nil
+		})
+		if err != nil || id != 7 || name != "hci7" {
+			t.Fatalf("select = %d %q %v", id, name, err)
+		}
+		want := []int{7}
+		if len(ids) == 2 {
+			want = []int{2, 7}
+		}
+		if !reflect.DeepEqual(probed, want) {
+			t.Fatalf("probed = %v, want %v", probed, want)
+		}
+	}
+	for _, count := range []uint16{0, hciMaxDevices + 1} {
+		if _, _, err := selectDevice(devListRequest{devNum: count}, func(int) (string, error) {
+			t.Fatal("invalid/empty list reached device probe")
+			return "", nil
+		}); err == nil {
+			t.Fatalf("accepted device-list count %d", count)
+		}
+	}
+}
+
+func TestDeviceACLRetryRechecksGuardAfterPoll(t *testing.T) {
+	d, peer := newSocketTestDevice(t, syscall.SOCK_STREAM)
+	fillDeviceSendBuffer(t, d)
+	if err := syscall.SetNonblock(peer, true); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	live := true
+	entered := make(chan struct{}, 1)
+	result := make(chan error, 1)
+	packet := []byte{0xcc, 0xdd}
+	go func() {
+		_, err := d.writeACL(packet, func(attempt func() (int, error)) (int, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if !live {
+				return 0, io.ErrClosedPipe
+			}
+			n, err := attempt()
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+			}
+			return n, err
+		})
+		result <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("ACL write did not enter a real poll wait")
+	}
+	// Acquiring this mutex while the socket is full proves polling is outside
+	// the guard. Retirement must be checked again before any subsequent syscall.
+	mu.Lock()
+	live = false
+	mu.Unlock()
+	buf := make([]byte, 128)
+	for {
+		n, err := syscall.Read(peer, buf)
+		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(buf[:n], packet) {
+			t.Fatal("retired ACL packet reached the socket")
+		}
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("retired retry = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("writable socket did not recheck ACL ownership")
 	}
 }

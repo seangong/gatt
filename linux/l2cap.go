@@ -55,6 +55,8 @@ type conn struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	writeGate      chan struct{}
+	aclOutstanding int             // Protected by hci.connsmu.
+	aclReserved    *aclReservation // Protected by hci.connsmu.
 }
 
 func newConn(hci *HCI, hh uint16) *conn {
@@ -175,24 +177,9 @@ func (c *conn) write(cid int, b []byte) (int, error) {
 			return max(0, tlen-n), io.ErrClosedPipe
 		case c.hci.bufCnt <- struct{}{}:
 		}
-		select {
-		case <-c.done:
-			<-c.hci.bufCnt
-			return max(0, tlen-n), io.ErrClosedPipe
-		default:
-		}
-
 		packet := w[:5+dlen]
-		written, err := c.hci.d.Write(packet)
-		if err == nil && written != len(packet) {
-			err = io.ErrShortWrite
-		}
+		err := c.writeACL(packet)
 		if err != nil {
-			select {
-			case <-c.hci.bufCnt:
-			default:
-			}
-			c.hci.requestClose(fmt.Errorf("hci: write ACL packet: %w", err))
 			return max(0, tlen-n), err
 		}
 		w = w[dlen:] // advance the pointer to the next segment, if any.

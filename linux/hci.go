@@ -34,6 +34,9 @@ type HCI struct {
 
 	bufCnt  chan struct{}
 	bufSize int
+	// aclSubmit serializes one non-blocking packet submission with credit and
+	// connection lifecycle events. It is never held across a poll wait.
+	aclSubmit sync.Mutex
 
 	maxConn int
 	connsmu *sync.Mutex
@@ -273,6 +276,7 @@ func (h *HCI) closeTransport() {
 	h.transportOnce.Do(func() {
 		h.c.Close()
 		h.connsmu.Lock()
+		var creditErr error
 		h.transportClosed = true
 		if a := h.pending; a != nil {
 			a.created()
@@ -281,10 +285,11 @@ func (h *HCI) closeTransport() {
 		}
 		for handle, c := range h.conns {
 			c.terminate(io.ErrClosedPipe)
+			creditErr = errors.Join(creditErr, c.releaseACL())
 			delete(h.conns, handle)
 		}
 		h.connsmu.Unlock()
-		h.transportErr = h.d.Close()
+		h.transportErr = errors.Join(creditErr, h.d.Close())
 	})
 }
 
@@ -686,6 +691,14 @@ func (h *HCI) handlePacket(b []byte) {
 		err = fmt.Errorf("SCO packet not supported")
 	case typEventPkt:
 		err = h.e.Dispatch(b)
+		// A malformed lifecycle/flow-control event can leave credits or
+		// connection ownership unknowable. Unsupported events and advertising
+		// errors retain their previous non-fatal handling.
+		if err != nil && len(b) != 0 && (b[0] == evt.NumberOfCompletedPkts ||
+			b[0] == evt.DisconnectionComplete ||
+			b[0] == evt.LEMeta && len(b) > 2 && b[2] == byte(evt.LEConnectionComplete)) {
+			h.requestClose(err)
+		}
 	case typVendorPkt:
 		err = fmt.Errorf("Vendor packet not supported")
 	default:
@@ -798,25 +811,54 @@ func (h *HCI) handleAdvertisement(b []byte) {
 func (h *HCI) handleNumberOfCompletedPkts(b []byte) error {
 	ep := &evt.NumberOfCompletedPktsEP{}
 	if err := ep.Unmarshal(b); err != nil {
+		h.requestClose(fmt.Errorf("hci: invalid completed-packets event: %w", err))
 		return err
 	}
+	h.aclSubmit.Lock()
+	h.connsmu.Lock()
+	// Validate the entire event before returning any credits. Duplicate handle
+	// records, if present, are included in the same connection's total.
+	completed := make(map[*conn]int, len(ep.Packets))
+	var err error
+	total := 0
 	for _, r := range ep.Packets {
-		for i := 0; i < int(r.NumOfCompletedPkts); i++ {
-			select {
-			case <-h.bufCnt:
-			default:
-				return fmt.Errorf("hci: completion exceeds outstanding ACL packets")
+		if r.NumOfCompletedPkts == 0 {
+			continue
+		}
+		c := h.conns[r.ConnectionHandle]
+		if c == nil || completed[c]+int(r.NumOfCompletedPkts) > c.aclOutstanding {
+			err = fmt.Errorf("hci: completion exceeds outstanding ACL packets for handle 0x%04x", r.ConnectionHandle)
+			break
+		}
+		completed[c] += int(r.NumOfCompletedPkts)
+		total += int(r.NumOfCompletedPkts)
+	}
+	if err == nil && total > len(h.bufCnt) {
+		err = errors.New("hci: inconsistent ACL credit accounting")
+	}
+	if err == nil {
+		for c, count := range completed {
+			c.aclOutstanding -= count
+			for i := 0; i < count; i++ {
+				<-h.bufCnt
 			}
 		}
 	}
-	return nil
+	h.connsmu.Unlock()
+	h.aclSubmit.Unlock()
+	if err != nil {
+		h.requestClose(err)
+	}
+	return err
 }
 
 func (h *HCI) handleConnection(b []byte) {
 	ep := &evt.LEConnectionCompleteEP{}
 	if err := ep.Unmarshal(b); err != nil {
+		h.requestClose(fmt.Errorf("hci: invalid connection-complete event: %w", err))
 		return
 	}
+	h.aclSubmit.Lock()
 	h.connsmu.Lock()
 	h.initLifecycle()
 	a := h.pending
@@ -834,6 +876,13 @@ func (h *HCI) handleConnection(b []byte) {
 		default:
 		}
 		h.connsmu.Unlock()
+		h.aclSubmit.Unlock()
+		return
+	}
+	if previous := h.conns[ep.ConnectionHandle]; previous != nil {
+		h.connsmu.Unlock()
+		h.aclSubmit.Unlock()
+		h.requestClose(fmt.Errorf("hci: active connection handle 0x%04x reused before disconnection", ep.ConnectionHandle))
 		return
 	}
 	c := newConn(h, ep.ConnectionHandle)
@@ -846,9 +895,6 @@ func (h *HCI) handleConnection(b []byte) {
 			h.pending = nil
 		}
 	}
-	if previous := h.conns[c.attr]; previous != nil {
-		previous.terminate(io.ErrClosedPipe)
-	}
 	h.conns[c.attr] = c
 	closing := h.closed || canceling
 	if closing {
@@ -859,6 +905,7 @@ func (h *HCI) handleConnection(b []byte) {
 	default:
 	}
 	h.connsmu.Unlock()
+	h.aclSubmit.Unlock()
 	if closing {
 		return
 	}
@@ -898,6 +945,7 @@ func (h *HCI) handleConnection(b []byte) {
 func (h *HCI) handleDisconnectionComplete(b []byte) error {
 	ep := &evt.DisconnectionCompleteEP{}
 	if err := ep.Unmarshal(b); err != nil {
+		h.requestClose(fmt.Errorf("hci: invalid disconnection-complete event: %w", err))
 		return err
 	}
 	if ep.Status != 0 {
@@ -905,10 +953,13 @@ func (h *HCI) handleDisconnectionComplete(b []byte) error {
 		h.requestClose(err)
 		return err
 	}
+	h.aclSubmit.Lock()
 	h.connsmu.Lock()
+	var creditErr error
 	if c := h.conns[ep.ConnectionHandle]; c != nil {
 		delete(h.conns, ep.ConnectionHandle)
 		c.terminate(nil)
+		creditErr = c.releaseACL()
 	}
 	h.initLifecycle()
 	select {
@@ -916,6 +967,11 @@ func (h *HCI) handleDisconnectionComplete(b []byte) error {
 	default:
 	}
 	h.connsmu.Unlock()
+	h.aclSubmit.Unlock()
+	if creditErr != nil {
+		h.requestClose(creditErr)
+		return creditErr
+	}
 	h.startWorker(func() {
 		if err := h.setAdvertiseEnable(true); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 			log.Printf("hci: re-enable advertising: %v", err)

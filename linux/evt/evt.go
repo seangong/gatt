@@ -147,7 +147,7 @@ func (h *EventHeader) Unmarshal(b []byte) error {
 	}
 	h.code = int(b[0])
 	h.plen = b[1]
-	if uint8(len(b)) != 2+h.plen {
+	if len(b) != 2+int(h.plen) {
 		return errors.New("wrong length")
 	}
 	return nil
@@ -192,10 +192,11 @@ type DisconnectionCompleteEP struct {
 }
 
 func (e *DisconnectionCompleteEP) Unmarshal(b []byte) error {
-	buf := bytes.NewBuffer(b)
-	binary.Read(buf, binary.LittleEndian, &e.Status)
-	binary.Read(buf, binary.LittleEndian, &e.ConnectionHandle)
-	return binary.Read(buf, binary.LittleEndian, &e.Reason)
+	if len(b) != 4 {
+		return errors.New("invalid disconnection-complete event length")
+	}
+	*e = DisconnectionCompleteEP{Status: b[0], ConnectionHandle: o.Uint16(b[1:3]), Reason: b[3]}
+	return nil
 }
 
 type CommandCompleteEP struct {
@@ -240,16 +241,19 @@ type NumberOfCompletedPktsEP struct {
 }
 
 func (e *NumberOfCompletedPktsEP) Unmarshal(b []byte) error {
-	e.NumberOfHandles = b[0]
-	n := int(e.NumberOfHandles)
-	buf := bytes.NewBuffer(b[1:])
-	e.Packets = make([]NumOfCompletedPkt, n)
-	for i := 0; i < n; i++ {
-		binary.Read(buf, binary.LittleEndian, &e.Packets[i].ConnectionHandle)
-		binary.Read(buf, binary.LittleEndian, &e.Packets[i].NumOfCompletedPkts)
-
-		e.Packets[i].ConnectionHandle &= 0xfff
+	if len(b) < 1 || len(b) != 1+4*int(b[0]) {
+		return errors.New("invalid completed-packets event length")
 	}
+	n := int(b[0])
+	packets := make([]NumOfCompletedPkt, n)
+	for i := range packets {
+		entry := b[1+4*i : 1+4*(i+1)]
+		packets[i] = NumOfCompletedPkt{
+			ConnectionHandle:   binary.LittleEndian.Uint16(entry[:2]) & 0x0fff,
+			NumOfCompletedPkts: binary.LittleEndian.Uint16(entry[2:]),
+		}
+	}
+	*e = NumberOfCompletedPktsEP{NumberOfHandles: b[0], Packets: packets}
 	return nil
 }
 
@@ -268,16 +272,15 @@ type LEConnectionCompleteEP struct {
 }
 
 func (e *LEConnectionCompleteEP) Unmarshal(b []byte) error {
-	e.SubeventCode = o.Uint8(b[0:])
-	e.Status = o.Uint8(b[1:])
-	e.ConnectionHandle = o.Uint16(b[2:])
-	e.Role = o.Uint8(b[4:])
-	e.PeerAddressType = o.Uint8(b[5:])
-	e.PeerAddress = o.MAC(b[6:])
-	e.ConnInterval = o.Uint16(b[12:])
-	e.ConnLatency = o.Uint16(b[14:])
-	e.SupervisionTimeout = o.Uint16(b[16:])
-	e.MasterClockAccuracy = o.Uint8(b[17:])
+	if len(b) != 19 {
+		return errors.New("invalid LE connection-complete event length")
+	}
+	*e = LEConnectionCompleteEP{
+		SubeventCode: b[0], Status: b[1], ConnectionHandle: o.Uint16(b[2:4]),
+		Role: b[4], PeerAddressType: b[5], PeerAddress: o.MAC(b[6:12]),
+		ConnInterval: o.Uint16(b[12:14]), ConnLatency: o.Uint16(b[14:16]),
+		SupervisionTimeout: o.Uint16(b[16:18]), MasterClockAccuracy: b[18],
+	}
 	return nil
 }
 

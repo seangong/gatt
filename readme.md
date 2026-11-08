@@ -34,7 +34,9 @@ Current limitations include:
   extended and periodic advertising are not implemented.
 - **Linux writes:** the server does not implement Read Multiple, Prepare Write,
   Execute Write or Signed Write. The client sends single ATT writes rather than
-  implementing reliable long writes.
+  implementing reliable long writes. A client write must fit both the current
+  `MTU-3` limit and the 512-byte attribute limit; oversized values return an
+  error without being sent or split.
 - **Linux client APIs:** `DiscoverIncludedServices` is unimplemented and returns
   `nil, nil`; `ReadRSSI` returns `-1`. Scan and discovery UUID filters are not
   implemented, so filter returned results in your application.
@@ -42,6 +44,10 @@ Current limitations include:
   are fixed in the implementation rather than fully negotiated from capacity.
 - **macOS APIs:** `DiscoverIncludedServices` and `SetMTU` are unimplemented;
   `SetIndicateValue` is a placeholder that returns `nil` without subscribing.
+- **macOS server writes:** the existing write handler cannot implement atomic
+  native batches. Batches with multiple writes and writes with a nonzero offset
+  are rejected before any business handler executes. This also rejects batches
+  of multiple writes without response that older code might have processed.
 
 The presence of an API, or a placeholder returning `nil`, is not evidence that
 an operation is implemented. See the
@@ -183,6 +189,15 @@ callbacks continue to report Bluetooth state changes.
 
 Business writes are not automatically replayed. Create a new device with
 `NewDevice` and reinitialize application state before continuing.
+
+macOS client discovery stages and validates each response before updating the
+cache. Unchanged attributes reuse their existing objects and subscriptions.
+UUID-filtered queries preserve other known attributes and CCCDs; partial
+responses are not treated as a complete database. A confirmed layout change
+returns `ErrDatabaseChanged` and cancels only that peripheral connection. Wait
+for its disconnection callback before reconnecting to the same device; other
+connections remain usable.
+Failed subscription changes preserve the previous callback.
 
 ## Minimal Linux server
 
@@ -339,6 +354,18 @@ leaves the previous cache intact. If a later complete discovery finds a changed
 layout, it returns an error matching `errors.Is(err, gatt.ErrDatabaseChanged)`
 and closes that connection. Reconnect and rediscover before using attribute
 handles again. Discovery UUID filters remain unimplemented as listed above.
+
+The Linux client supports local `SetMTU` values from 23 through 517. An invalid
+local value is rejected without sending a request. A peer MTU below 23 leaves
+the effective MTU at the default 23; a larger peer value is bounded by the local
+request. These bounds describe this implementation's supported receive size.
+
+After a complete ATT request is sent, the Linux client waits up to 30 seconds
+for its response. Timeout errors match `context.DeadlineExceeded`; the bearer
+is closed and queued operations are released. Establish a new connection before
+retrying, and do not automatically replay business writes. Queueing, controller
+credit waits and local transport writes precede this response timer, so it is
+not a total API-call deadline. Writes without response have no response timer.
 
 ## Linux shutdown and reopening
 

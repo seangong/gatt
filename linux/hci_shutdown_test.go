@@ -56,6 +56,20 @@ func (d *shutdownTestTransport) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+func (d *shutdownTestTransport) writeACL(b []byte, submit aclSubmitFunc) (int, error) {
+	if d.blockWrite {
+		// Model a poll wait, outside the submission fence.
+		select {
+		case <-d.closed:
+			return 0, io.ErrClosedPipe
+		case d.writes <- append([]byte(nil), b...):
+		}
+		<-d.closed
+		return 0, io.ErrClosedPipe
+	}
+	return submit(func() (int, error) { return d.Write(b) })
+}
+
 func (d *shutdownTestTransport) Close() error {
 	d.closeOnce.Do(func() {
 		d.closeCount.Add(1)
@@ -79,6 +93,7 @@ func newShutdownTestHCI(t *testing.T, blockWrite bool) (*HCI, *shutdownTestTrans
 	}
 	h.e.HandleEvent(evt.CommandStatus, evt.HandlerFunc(h.c.HandleStatus))
 	h.e.HandleEvent(evt.CommandComplete, evt.HandlerFunc(h.c.HandleComplete))
+	h.e.HandleEvent(evt.NumberOfCompletedPkts, evt.HandlerFunc(h.handleNumberOfCompletedPkts))
 	h.e.HandleEvent(evt.DisconnectionComplete, evt.HandlerFunc(h.handleDisconnectionComplete))
 	h.e.HandleEvent(evt.LEMeta, evt.HandlerFunc(h.handleLEMeta))
 	go h.mainLoop()

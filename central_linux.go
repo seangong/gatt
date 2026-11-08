@@ -350,18 +350,10 @@ func (c *central) handleFindByTypeValue(b []byte) []byte {
 	return w.Bytes()
 }
 
-func attErrorForStatus(status byte) attEcode {
-	switch status {
-	case StatusSuccess:
-		return attEcodeSuccess
-	case StatusInvalidOffset:
-		return attEcodeInvalidOffset
-	default:
-		return attEcodeUnlikely
-	}
-}
-
 func (c *central) readValue(a attr, capacity, offset int) ([]byte, attEcode) {
+	if a.props&CharRead == 0 {
+		return nil, attEcodeReadNotPerm
+	}
 	v := a.value
 	if a.typ.Equal(attrClientCharacteristicConfigUUID) {
 		c.notifiersmu.Lock()
@@ -378,6 +370,16 @@ func (c *central) readValue(a attr, capacity, offset int) ([]byte, attEcode) {
 		}
 		return v[offset:], attEcodeSuccess
 	}
+	var handler ReadHandler
+	switch target := a.pvt.(type) {
+	case *Characteristic:
+		handler = target.rhandler
+	case *Descriptor:
+		handler = target.rhandler
+	}
+	if handler == nil {
+		return nil, attEcodeUnlikely
+	}
 	rsp := newResponseWriter(capacity)
 	req := &ReadRequest{
 		Request: Request{Central: c},
@@ -385,12 +387,7 @@ func (c *central) readValue(a attr, capacity, offset int) ([]byte, attEcode) {
 		Offset:  offset,
 	}
 	if !c.callHandler(func() {
-		switch target := a.pvt.(type) {
-		case *Characteristic:
-			target.rhandler.ServeRead(rsp, req)
-		case *Descriptor:
-			target.rhandler.ServeRead(rsp, req)
-		}
+		handler.ServeRead(rsp, req)
 	}) {
 		return nil, attEcodeUnlikely
 	}

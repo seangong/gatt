@@ -318,15 +318,37 @@ func (d *device) Connect(p Peripheral) {
 		}
 		return
 	}
-	d.plist[pp.id.String()] = pp
+	if previous := d.plist[pp.ID()]; previous != nil &&
+		(previous.closing || previous.cancel != nil && context.Cause(previous.context()) != nil) {
+		err := context.Cause(previous.context())
+		if err == nil {
+			err = io.ErrClosedPipe
+		}
+		d.plistmu.Unlock()
+		if d.peripheralConnected != nil {
+			go d.peripheralConnected(p, err)
+		}
+		return
+	}
+	pending := pp
+	if pp.cancel != nil && d.plist[pp.ID()] != pp {
+		// A connected object owns its original context and caches, even after
+		// removal from the registry. Reconnection must not reuse its state.
+		pending = &peripheral{id: pp.id, d: d, name: pp.name, connectSource: pp}
+	}
+	d.plist[pp.id.String()] = pending
+	// Registration and local enqueue share the registry lock so cancellation
+	// cannot overtake this connect. SendError does not wait for peer callbacks.
+	err := d.conn.SendError(xpc.Dict{"kCBMsgId": 31, "kCBMsgArgs": xpc.Dict{
+		"kCBMsgArgDeviceUUID": pp.id,
+		"kCBMsgArgOptions": xpc.Dict{
+			"kCBConnectOptionNotifyOnDisconnection": 1,
+		},
+	}}, false)
 	d.plistmu.Unlock()
-	d.sendCmd(31,
-		xpc.Dict{
-			"kCBMsgArgDeviceUUID": pp.id,
-			"kCBMsgArgOptions": xpc.Dict{
-				"kCBConnectOptionNotifyOnDisconnection": 1,
-			},
-		})
+	if err != nil {
+		d.fail(err)
+	}
 }
 
 func (d *device) respondToRequest(id int, args xpc.Dict) {
@@ -339,71 +361,122 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 		o := args.MustGetInt("kCBMsgArgOffset")
 
 		d.attrmu.RLock()
-		attr := d.attrs[a]
+		attribute := d.attrs[a]
 		d.attrmu.RUnlock()
-		if attr == nil {
+		if attribute == nil {
+			d.respondATT(a, t, nil, attEcodeInvalidHandle)
 			return
 		}
-		v := attr.value
+		v := attribute.value
+		code := attEcodeSuccess
 		if v == nil {
-			c := newCentral(d, u)
-			req := &ReadRequest{
-				Request: Request{Central: c},
-				Cap:     int(c.mtu - 1),
-				Offset:  o,
+			var handler ReadHandler
+			switch target := attribute.pvt.(type) {
+			case *Characteristic:
+				if target != nil {
+					handler = target.rhandler
+				}
+			case *Descriptor:
+				if target != nil {
+					handler = target.rhandler
+				}
 			}
-			rsp := newResponseWriter(int(c.mtu - 1))
-			if c, ok := attr.pvt.(*Characteristic); ok {
-				c.rhandler.ServeRead(rsp, req)
-				v = rsp.bytes()
+			if handler == nil {
+				code = attEcodeReadNotPerm
+			} else {
+				c := newCentral(d, u)
+				req := &ReadRequest{
+					Request: Request{Central: c},
+					Cap:     int(c.mtu - 1),
+					Offset:  o,
+				}
+				rsp := newResponseWriter(req.Cap)
+				handler.ServeRead(rsp, req)
+				code = attErrorForStatus(rsp.status)
+				if code == attEcodeSuccess {
+					v = rsp.bytes()
+				}
 			}
 		}
-
-		d.sendCmd(13, xpc.Dict{
-			"kCBMsgArgAttributeID":   a,
-			"kCBMsgArgData":          v,
-			"kCBMsgArgTransactionID": t,
-			"kCBMsgArgResult":        0,
-		})
+		d.respondATT(a, t, v, code)
 
 	case 20: // WriteRequest
-		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
 		t := args.MustGetInt("kCBMsgArgTransactionID")
-		a := 0
-		noRsp := false
-		xxws := args.MustGetArray("kCBMsgArgATTWrites")
-		for _, xxw := range xxws {
-			xw := xxw.(xpc.Dict)
-			if a == 0 {
-				a = xw.MustGetInt("kCBMsgArgAttributeID")
-			}
-			o := xw.MustGetInt("kCBMsgArgOffset")
-			i := xw.MustGetInt("kCBMsgArgIgnoreResponse")
-			b := xw.MustGetBytes("kCBMsgArgData")
-			_ = o
-			d.attrmu.RLock()
-			attr := d.attrs[a]
-			d.attrmu.RUnlock()
-			if attr == nil {
-				return
-			}
-			c := newCentral(d, u)
-			r := Request{Central: c}
-			attr.pvt.(*Characteristic).whandler.ServeWrite(r, b)
-			if i == 1 {
-				noRsp = true
-			}
-
+		writes, ok := args["kCBMsgArgATTWrites"].(xpc.Array)
+		if !ok || len(writes) == 0 {
+			d.respondATT(0, t, nil, attEcodeInvalidPDU)
+			return
 		}
-		if noRsp {
-			break
+		a, noRsp, valid := 0, true, true
+		hasResponseAttribute := false
+		var single xpc.Dict
+		for _, item := range writes {
+			w, ok := item.(xpc.Dict)
+			if !ok {
+				valid, noRsp = false, false
+				continue
+			}
+			h, validHandle := w["kCBMsgArgAttributeID"].(int64)
+			i, validIgnore := w["kCBMsgArgIgnoreResponse"].(int64)
+			if a == 0 && validHandle {
+				a = int(h)
+			}
+			if !validIgnore || i != 1 {
+				noRsp = false
+				if !hasResponseAttribute && validHandle {
+					a, hasResponseAttribute = int(h), true
+				}
+			}
+			if !validHandle || h <= 0 || !validIgnore || i < 0 || i > 1 {
+				valid = false
+			}
+			single = w
 		}
-		d.sendCmd(13, xpc.Dict{
-			"kCBMsgArgAttributeID":   a,
-			"kCBMsgArgData":          nil,
-			"kCBMsgArgTransactionID": t,
-			"kCBMsgArgResult":        0,
-		})
+		code := attEcodeSuccess
+		switch {
+		case !valid:
+			code = attEcodeInvalidPDU
+		case len(writes) != 1:
+			// ServeWrite can have arbitrary side effects and provides no rollback.
+			// Reject the whole native atomic batch before invoking any handler.
+			code = attEcodeReqNotSupp
+		default:
+			o, validOffset := single["kCBMsgArgOffset"].(int64)
+			b, validData := single["kCBMsgArgData"].([]byte)
+			if !validOffset || !validData {
+				code = attEcodeInvalidPDU
+			} else if o != 0 {
+				code = attEcodeInvalidOffset
+			} else {
+				d.attrmu.RLock()
+				attribute := d.attrs[a]
+				d.attrmu.RUnlock()
+				if attribute == nil {
+					code = attEcodeInvalidHandle
+				} else {
+					var handler WriteHandler
+					switch target := attribute.pvt.(type) {
+					case *Characteristic:
+						if target != nil {
+							handler = target.whandler
+						}
+					case *Descriptor:
+						if target != nil {
+							handler = target.whandler
+						}
+					}
+					if handler == nil {
+						code = attEcodeWriteNotPerm
+					} else {
+						u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
+						code = attErrorForStatus(handler.ServeWrite(Request{Central: newCentral(d, u)}, b))
+					}
+				}
+			}
+		}
+		if !noRsp {
+			d.respondATT(a, t, nil, code)
+		}
 
 	case 21: // subscribed
 		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
@@ -443,8 +516,40 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 	}
 }
 
+func (d *device) respondATT(attribute, transaction int, value []byte, code attEcode) {
+	d.sendCmd(13, xpc.Dict{
+		"kCBMsgArgAttributeID":   attribute,
+		"kCBMsgArgData":          value,
+		"kCBMsgArgTransactionID": transaction,
+		"kCBMsgArgResult":        int(code),
+	})
+}
+
 func (d *device) CancelConnection(p Peripheral) {
-	d.sendCmd(32, xpc.Dict{"kCBMsgArgDeviceUUID": p.(*peripheral).id})
+	pp := p.(*peripheral)
+	d.plistmu.Lock()
+	if context.Cause(d.ctx) != nil {
+		d.plistmu.Unlock()
+		return
+	}
+	current := d.plist[pp.ID()]
+	// A retired object may cancel its explicit pending reconnect, but never a
+	// newer connected session. Keep closing entries until native disconnection.
+	fromPendingReconnect := current != nil && current.cancel == nil && current.connectSource == pp
+	if pp.cancel != nil && current != pp && !fromPendingReconnect || current != nil && current.closing {
+		d.plistmu.Unlock()
+		return
+	}
+	if current != nil {
+		current.closing = true
+	}
+	// Keep the old UUID owner registered until its cancel is locally queued.
+	// Native disconnection/reconnection cannot publish a newer owner in between.
+	err := d.conn.SendError(xpc.Dict{"kCBMsgId": 32, "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": pp.id}}, false)
+	d.plistmu.Unlock()
+	if err != nil {
+		d.fail(err)
+	}
 }
 
 // process device events and asynchronous errors
@@ -534,6 +639,12 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 			p.stop(err)
 			return
 		}
+		if previous := d.plist[p.ID()]; previous != nil &&
+			(previous.closing || previous.cancel != nil && context.Cause(previous.context()) != nil) {
+			d.plistmu.Unlock()
+			p.stop(io.ErrClosedPipe)
+			return
+		}
 		d.plist[xpc.UUID(u.b).String()] = p
 		d.plistmu.Unlock()
 
@@ -550,9 +661,17 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 		if p == nil {
 			return
 		}
+		cause := context.Cause(p.context())
+		if !errors.Is(cause, ErrDatabaseChanged) {
+			cause = nil
+		}
 		p.stop(io.ErrClosedPipe)
 		if d.peripheralDisconnected != nil {
-			go d.peripheralDisconnected(p, nil) // TODO: Get Result as error?
+			callbackPeripheral := p
+			if p.connectSource != nil {
+				callbackPeripheral = p.connectSource
+			}
+			go d.peripheralDisconnected(callbackPeripheral, cause) // TODO: Get Result as error?
 		}
 
 	case // Peripheral events
@@ -615,7 +734,11 @@ func (d *device) fail(err error) {
 		p.stop(err)
 		if p.cancel == nil {
 			if d.peripheralConnected != nil {
-				go d.peripheralConnected(p, err)
+				callbackPeripheral := p
+				if p.connectSource != nil {
+					callbackPeripheral = p.connectSource
+				}
+				go d.peripheralConnected(callbackPeripheral, err)
 			}
 		} else if d.peripheralDisconnected != nil {
 			go d.peripheralDisconnected(p, err)

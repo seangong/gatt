@@ -55,15 +55,29 @@ func newDevice(n int, chk bool) (_ *device, err error) {
 	if err := gioctl.Ioctl(uintptr(fd), hciGetDeviceList, uintptr(unsafe.Pointer(&req))); err != nil {
 		return nil, err
 	}
-	for i := 0; i < int(req.devNum); i++ {
-		name, err := newSocket(fd, i, chk)
-		if err == nil {
-			d.dev, d.name = i, name
-			log.Printf("dev: %s opened", d.name)
-			return d, nil
+	d.dev, d.name, err = selectDevice(req, func(id int) (string, error) {
+		return newSocket(fd, id, chk)
+	})
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("dev: %s opened", d.name)
+	return d, nil
+}
+
+// selectDevice uses the identifiers returned by the kernel; they need not be
+// contiguous after controllers have been attached or removed.
+func selectDevice(req devListRequest, probe func(int) (string, error)) (int, string, error) {
+	if int(req.devNum) > len(req.devRequest) {
+		return 0, "", errors.New("invalid HCI device list length")
+	}
+	for _, entry := range req.devRequest[:int(req.devNum)] {
+		id := int(entry.id)
+		if name, err := probe(id); err == nil {
+			return id, name, nil
 		}
 	}
-	return nil, errors.New("no supported devices available")
+	return 0, "", errors.New("no supported devices available")
 }
 
 // newPollDevice takes ownership of fd, including when initialization fails.
@@ -140,11 +154,24 @@ func (d *device) Read(b []byte) (int, error) {
 }
 
 func (d *device) Write(b []byte) (int, error) {
+	return d.writePacket(b, nil)
+}
+
+func (d *device) writeACL(b []byte, submit aclSubmitFunc) (int, error) {
+	return d.writePacket(b, submit)
+}
+
+func (d *device) writePacket(b []byte, submit aclSubmitFunc) (int, error) {
 	var n int
 	var writeErr error
 	err := d.raw.Write(func(fd uintptr) bool {
 		for {
-			n, writeErr = syscall.Write(int(fd), b)
+			attempt := func() (int, error) { return syscall.Write(int(fd), b) }
+			if submit == nil {
+				n, writeErr = attempt()
+			} else {
+				n, writeErr = submit(attempt)
+			}
 			if writeErr == syscall.EINTR {
 				continue
 			}

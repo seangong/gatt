@@ -336,13 +336,17 @@ func valueToXpc(val r.Value) C.xpc_object_t {
 		xv = C.xpc_int64_create(C.int64_t(val.Uint()))
 
 	case r.String:
-		xv = C.xpc_string_create(C.CString(val.String()))
+		str := C.CString(val.String())
+		xv = C.xpc_string_create(str)
+		C.free(unsafe.Pointer(str))
 
 	case r.Map:
 		xv = C.xpc_dictionary_create(nil, nil, 0)
 		for _, k := range val.MapKeys() {
 			v := valueToXpc(val.MapIndex(k))
-			C.xpc_dictionary_set_value(xv, C.CString(k.String()), v)
+			key := C.CString(k.String())
+			C.xpc_dictionary_set_value(xv, key, v)
+			C.free(unsafe.Pointer(key))
 			if v != nil {
 				C.xpc_release(v)
 			}

@@ -11,9 +11,12 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/seangong/gatt/v2/linux"
 )
+
+const attTransactionTimeout = 30 * time.Second
 
 type peripheral struct {
 	// NameChanged is called whenever the peripheral GAP device name has changed.
@@ -601,6 +604,18 @@ func (p *peripheral) requestLoop(rspc <-chan []byte) {
 			return
 		}
 		result := peripheralResult{mtu: p.mtu}
+		if err := validPeripheralRequest(req.op, req.b, p.mtu); err != nil {
+			result.err = err
+			select {
+			case <-p.quitc:
+				return
+			case <-done:
+				p.stop(io.ErrClosedPipe)
+				return
+			case req.rspc <- result:
+				continue
+			}
+		}
 		n, err := p.l2c.Write(req.b)
 		if err == nil && n != len(req.b) {
 			err = io.ErrShortWrite
@@ -610,13 +625,22 @@ func (p *peripheral) requestLoop(rspc <-chan []byte) {
 			return
 		}
 		if !req.noRsp {
+			// Queueing and local transport writes are not response-wait time.
+			// A timed-out bearer is retired before another request can be sent.
+			timer := time.NewTimer(attTransactionTimeout)
 			select {
 			case <-p.quitc:
+				timer.Stop()
 				return
 			case <-done:
+				timer.Stop()
 				p.stop(io.ErrClosedPipe)
 				return
+			case <-timer.C:
+				p.abort(fmt.Errorf("ATT operation 0x%02x response timeout: %w", req.op, context.DeadlineExceeded))
+				return
 			case result.b = <-rspc:
+				timer.Stop()
 			}
 			if err := validPeripheralResponse(req.op, result.b); err != nil {
 				p.abort(err)
@@ -628,7 +652,10 @@ func (p *peripheral) requestLoop(rspc <-chan []byte) {
 			} else if req.op == attOpMtuReq {
 				clientMTU := binary.LittleEndian.Uint16(req.b[1:3])
 				serverMTU := binary.LittleEndian.Uint16(result.b[1:3])
-				p.mtu = min(clientMTU, serverMTU)
+				p.mtu = attDefaultMTU
+				if clientMTU >= attDefaultMTU && serverMTU >= attDefaultMTU {
+					p.mtu = min(clientMTU, serverMTU)
+				}
 			}
 		}
 		select {
@@ -640,6 +667,23 @@ func (p *peripheral) requestLoop(rspc <-chan []byte) {
 		case req.rspc <- result:
 		}
 	}
+}
+
+func validPeripheralRequest(op byte, b []byte, mtu uint16) error {
+	switch op {
+	case attOpWriteReq, attOpWriteCmd:
+		if len(b) < 3 || len(b) > int(mtu) || len(b)-3 > attMaxValueLen {
+			return fmt.Errorf("ATT write PDU length %d exceeds MTU %d or value limit %d: %w", len(b), mtu, attMaxValueLen, ErrInvalidLength)
+		}
+	case attOpMtuReq:
+		if len(b) != 3 {
+			return ErrInvalidLength
+		}
+		if requested := binary.LittleEndian.Uint16(b[1:3]); requested < attDefaultMTU || requested > attMaxMTU {
+			return fmt.Errorf("unsupported ATT MTU %d (supported %d..%d): %w", requested, attDefaultMTU, attMaxMTU, ErrInvalidLength)
+		}
+	}
+	return nil
 }
 
 func validPeripheralResponse(op byte, b []byte) error {
@@ -756,6 +800,9 @@ func (p *peripheral) loop() {
 }
 
 func (p *peripheral) SetMTU(mtu uint16) error {
+	if mtu < attDefaultMTU || mtu > attMaxMTU {
+		return fmt.Errorf("unsupported ATT MTU %d (supported %d..%d): %w", mtu, attDefaultMTU, attMaxMTU, ErrInvalidLength)
+	}
 	b := make([]byte, 3)
 	op := byte(attOpMtuReq)
 	b[0] = op
