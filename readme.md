@@ -53,17 +53,22 @@ platform-specific source for individual operations.
 The current source requires **Go 1.26.4 or newer**, as declared in
 [`go.mod`](go.mod). Run dependency commands from your application's module.
 
-For a reproducible snapshot containing the shutdown, read-status, CCCD,
-indication and advertising-initialization fixes described below:
+To use the development branch, then inspect and pin its resolved version:
 
 ```sh
-go get github.com/seangong/gatt/v2@c03f1f502cb4
+go get github.com/seangong/gatt/v2@master
 go list -m github.com/seangong/gatt/v2
 ```
 
-That commit resolves to `v2.0.1-0.20261107051419-c03f1f502cb4`. You can use
-`@master` to follow development, but pin the resolved version for reproducible
-builds. See [Go version queries](https://go.dev/ref/mod#version-queries).
+Use the resolved commit or pseudo-version for reproducible builds. Branch
+queries can be cached by module proxies; see the troubleshooting section below
+and [Go version queries](https://go.dev/ref/mod#version-queries).
+
+The earlier snapshot `v2.0.1-0.20261107051419-c03f1f502cb4` contains the shutdown,
+read-status, CCCD, indication and advertising-initialization fixes, but predates
+the advertising-parser, `AdvPacket.Err()` and client-MTU changes described here.
+Unpublished local changes require an explicit local module replacement; fetching
+`@master` only retrieves published commits.
 
 For a published release:
 
@@ -213,6 +218,17 @@ scan-response packets each have a 31-byte budget, including field headers.
 Advertise a discovery UUID that fits; clients can discover the remaining
 services after connecting.
 
+`AdvPacket` append methods retain their existing payload-truncation behavior.
+If even a field's two-byte header cannot fit, the packet keeps its previous
+contents and `Err()` reports `ErrEIRPacketTooLong`. `Advertise` returns that
+error before changing advertising state or sending commands. Construct a new
+packet after a build error. When using `Bytes()` with low-level advertising
+options, check `Err()` first; `Bytes()` and `Len()` alone do not report errors.
+
+Linux scanning preserves valid fields when another advertising field is
+malformed. Padding and unparseable tails are removed separately from each
+advertising or scan-response payload before they are combined.
+
 ## Linux reads, writes and subscriptions
 
 Dynamic read handlers receive `ReadRequest.Cap` and `ReadRequest.Offset`. Return
@@ -234,6 +250,10 @@ sender needs to know the business result.
 
 The default ATT MTU is 23. Linux accepts MTUs up to 517, while a single
 notification or indication value is limited to `min(MTU - 3, 512)` bytes.
+Linux client connections also start at MTU 23; an explicit `SetMTU` call is not
+required before `ReadLongCharacteristic`. A successful MTU exchange takes
+effect before the next ATT request, and each read uses its transaction's MTU
+when determining whether more data remains.
 Read `Notifier.Cap()` after negotiation rather than assuming a fixed size.
 Oversized writes return `0, io.ErrShortWrite` without sending a value. The library
 does not split a value into multiple ATT notifications.

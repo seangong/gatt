@@ -293,11 +293,18 @@ type LEAdvertisingReportEP struct {
 }
 
 func (e *LEAdvertisingReportEP) Unmarshal(b []byte) error {
+	if len(b) < 2 {
+		return errors.New("invalid LE advertising report header")
+	}
 	e.SubeventCode = o.Uint8(b)
 	b = b[1:]
 	e.NumReports = o.Uint8(b)
 	b = b[1:]
 	n := int(e.NumReports)
+	// Each report needs event/address types, an address, data length and RSSI.
+	if len(b) < n*10 {
+		return errors.New("invalid LE advertising report length")
+	}
 	e.EventType = make([]uint8, n)
 	e.AddressType = make([]uint8, n)
 	e.Address = make([][6]byte, n)
@@ -320,6 +327,13 @@ func (e *LEAdvertisingReportEP) Unmarshal(b []byte) error {
 	for i := 0; i < n; i++ {
 		e.Length[i] = o.Uint8(b)
 		b = b[1:]
+	}
+	dataLength := 0
+	for _, length := range e.Length {
+		dataLength += int(length)
+	}
+	if len(b) < dataLength+n {
+		return errors.New("invalid LE advertising report data length")
 	}
 	for i := 0; i < n; i++ {
 		e.Data[i] = make([]byte, e.Length[i])

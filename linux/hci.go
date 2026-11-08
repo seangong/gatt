@@ -725,6 +725,20 @@ func (h *HCI) resetDevice(ctx context.Context) error {
 	return nil
 }
 
+// Keep only complete AD structures from one payload before merging it with
+// other reports. Padding or a malformed tail must not hide a later scan response.
+func advertisingDataPrefix(data []byte) []byte {
+	end := 0
+	for end < len(data) {
+		length := int(data[end])
+		if length == 0 || length > len(data)-end-1 {
+			break
+		}
+		end += length + 1
+	}
+	return data[:end]
+}
+
 func (h *HCI) handleAdvertisement(b []byte) {
 	// If no one is interested, don't bother.
 	if h.AdvertisementHandler == nil {
@@ -739,13 +753,14 @@ func (h *HCI) handleAdvertisement(b []byte) {
 		et := ep.EventType[i]
 		connectable := et == advInd || et == advDirectInd
 		scannable := et == advInd || et == advScanInd
+		data := advertisingDataPrefix(ep.Data[i])
 
 		if et == scanRsp {
 			h.plistmu.Lock()
 			pd, ok := h.plist[addr]
 			var report PlatData
 			if ok {
-				pd.Data = append(pd.Data, ep.Data[i]...)
+				pd.Data = append(pd.Data, data...)
 				report = *pd
 				report.Data = append([]byte(nil), pd.Data...)
 			}
@@ -759,7 +774,7 @@ func (h *HCI) handleAdvertisement(b []byte) {
 		pd := &PlatData{
 			AddressType: ep.AddressType[i],
 			Address:     ep.Address[i],
-			Data:        ep.Data[i],
+			Data:        data,
 			Connectable: connectable,
 			RSSI:        ep.RSSI[i],
 		}

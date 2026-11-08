@@ -251,12 +251,15 @@ func TestPeripheralSerialRequestsKeepNotificationDelivery(t *testing.T) {
 	notified := make(chan []byte, 1)
 	p.sub.subscribe(3, func(b []byte, _ error) { notified <- b })
 	first := make(chan peripheralResult, 1)
-	go func() { b, err := p.ReadCharacteristic(&Characteristic{vh: 1}); first <- peripheralResult{b, err} }()
+	go func() {
+		b, err := p.ReadCharacteristic(&Characteristic{vh: 1})
+		first <- peripheralResult{b: b, err: err}
+	}()
 	if got := peripheralWriteForTest(t, c); !bytes.Equal(got, []byte{attOpReadReq, 1, 0}) {
 		t.Fatalf("first request = %x", got)
 	}
 	second := make(chan peripheralResult, 1)
-	go func() { b, err := p.ReadDescriptor(&Descriptor{h: 2}); second <- peripheralResult{b, err} }()
+	go func() { b, err := p.ReadDescriptor(&Descriptor{h: 2}); second <- peripheralResult{b: b, err: err} }()
 	c.reads <- peripheralTestRead{b: []byte{attOpHandleInd, 3, 0, 'n'}}
 	if got := peripheralWriteForTest(t, c); !bytes.Equal(got, []byte{attOpHandleCnf}) {
 		t.Fatalf("indication confirmation = %x", got)

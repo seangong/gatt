@@ -81,6 +81,9 @@ func (a *Advertisement) unmarshall(b []byte) error {
 
 	// Utility function for creating a list of uuids.
 	uuidList := func(u []UUID, d []byte, w int) []UUID {
+		if len(d)%w != 0 {
+			return u
+		}
 		for len(d) > 0 {
 			u = append(u, UUID{d[:w]})
 			d = d[w:]
@@ -89,13 +92,14 @@ func (a *Advertisement) unmarshall(b []byte) error {
 	}
 
 	for len(b) > 0 {
-		if len(b) < 2 {
+		l := int(b[0])
+		if l == 0 {
+			return nil
+		}
+		if l > len(b)-1 {
 			return errors.New("invalid advertise data")
 		}
-		l, t := b[0], b[1]
-		if len(b) < int(1+l) {
-			return errors.New("invalid advertise data")
-		}
+		t := b[1]
 		d := b[2 : 1+l]
 		switch t {
 		case typeFlags:
@@ -117,7 +121,9 @@ func (a *Advertisement) unmarshall(b []byte) error {
 		case typeCompleteName:
 			a.LocalName = string(d)
 		case typeTxPower:
-			a.TxPowerLevel = int(d[0])
+			if len(d) > 0 {
+				a.TxPowerLevel = int(d[0])
+			}
 		case typeServiceSol16:
 			a.SolicitedService = uuidList(a.SolicitedService, d, 2)
 		case typeServiceSol128:
@@ -140,7 +146,8 @@ func (a *Advertisement) unmarshall(b []byte) error {
 
 // AdvPacket is an utility to help crafting advertisment or scan response data.
 type AdvPacket struct {
-	b []byte
+	b   []byte
+	err error
 }
 
 // Bytes returns an 31-byte array, which contains up to 31 bytes of the packet.
@@ -158,13 +165,25 @@ func (a *AdvPacket) Len() int {
 	return len(a.b)
 }
 
+// Err reports a field whose header could not fit in the packet.
+// Truncating field data to fit does not set an error.
+func (a *AdvPacket) Err() error {
+	return a.err
+}
+
 // AppendField appends a BLE advertising packet field.
-// TODO: refuse to append field if it'd make the packet too long.
+// Data is truncated to fit. If the field header does not fit, the packet is
+// unchanged and Err reports ErrEIRPacketTooLong.
 func (a *AdvPacket) AppendField(typ byte, b []byte) *AdvPacket {
 	// A field consists of len, typ, b.
 	// Len is 1 byte for typ plus len(b).
-	if len(a.b)+2+len(b) > MaxEIRPacketLength {
-		b = b[:MaxEIRPacketLength-len(a.b)-2]
+	remaining := MaxEIRPacketLength - len(a.b) - 2
+	if remaining < 0 {
+		a.err = ErrEIRPacketTooLong
+		return a
+	}
+	if len(b) > remaining {
+		b = b[:remaining]
 	}
 	a.b = append(a.b, byte(len(b)+1))
 	a.b = append(a.b, typ)

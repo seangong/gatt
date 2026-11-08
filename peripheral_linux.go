@@ -28,7 +28,7 @@ type peripheral struct {
 
 	sub *subscriber
 
-	mtu uint16
+	mtu uint16 // Owned by requestLoop after the connection starts.
 	l2c io.ReadWriteCloser
 
 	reqc       chan message
@@ -229,17 +229,19 @@ func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descr
 }
 
 func (p *peripheral) ReadCharacteristic(c *Characteristic) ([]byte, error) {
+	result := p.readCharacteristic(c)
+	if result.err != nil {
+		return nil, result.err
+	}
+	return result.b[1:], nil
+}
+
+func (p *peripheral) readCharacteristic(c *Characteristic) peripheralResult {
 	b := make([]byte, 3)
 	op := byte(attOpReadReq)
 	b[0] = op
 	binary.LittleEndian.PutUint16(b[1:3], c.vh)
-
-	b, err := p.sendReq(op, b)
-	if err != nil {
-		return nil, err
-	}
-	b = b[1:]
-	return b, nil
+	return p.send(op, b, false)
 }
 
 func (p *peripheral) ReadLongCharacteristic(c *Characteristic) ([]byte, error) {
@@ -247,35 +249,48 @@ func (p *peripheral) ReadLongCharacteristic(c *Characteristic) ([]byte, error) {
 	// is smaller than mtu - 1.  To simplify the API, the first read is done
 	// with a regular read request.  If the buffer received is equal to mtu -1,
 	// then we read the rest of the data using read blob.
-	firstRead, err := p.ReadCharacteristic(c)
-	if err != nil {
-		return nil, err
+	first := p.readCharacteristic(c)
+	if first.err != nil {
+		return nil, first.err
 	}
-	if len(firstRead) < int(p.mtu)-1 {
+	firstRead := first.b[1:]
+	if len(firstRead) < int(first.mtu)-1 {
 		return firstRead, nil
 	}
 
 	var buf bytes.Buffer
 	buf.Write(firstRead)
-	off := uint16(len(firstRead))
+	off := len(firstRead)
+	firstBlob := true
 	for {
+		if off > 0xffff {
+			return nil, fmt.Errorf("read blob offset %d exceeds uint16: %w", off, ErrInvalidLength)
+		}
 		b := make([]byte, 5)
 		op := byte(attOpReadBlobReq)
 		b[0] = op
 		binary.LittleEndian.PutUint16(b[1:3], c.vh)
-		binary.LittleEndian.PutUint16(b[3:5], off)
+		binary.LittleEndian.PutUint16(b[3:5], uint16(off))
 
-		b, err = p.sendReq(op, b)
-		if err != nil {
-			return nil, err
+		result := p.send(op, b, false)
+		if result.err != nil {
+			// A fixed value that exactly filled the first response may reject
+			// the first blob. An intervening MTU change cannot prove completeness.
+			if firstBlob && result.mtu == first.mtu && len(firstRead) == int(first.mtu)-1 &&
+				errors.Is(result.err, attEcodeAttrNotLong) && len(result.b) == 5 &&
+				result.b[1] == attOpReadBlobReq && binary.LittleEndian.Uint16(result.b[2:4]) == c.vh {
+				return firstRead, nil
+			}
+			return nil, result.err
 		}
-		b = b[1:]
+		firstBlob = false
+		b = result.b[1:]
 		if len(b) == 0 {
 			break
 		}
 		buf.Write(b)
-		off += uint16(len(b))
-		if len(b) < int(p.mtu)-1 {
+		off += len(b)
+		if len(b) < int(result.mtu)-1 {
 			break
 		}
 	}
@@ -407,6 +422,7 @@ type message struct {
 type peripheralResult struct {
 	b   []byte
 	err error
+	mtu uint16 // MTU in effect when this request was sent.
 }
 
 func (p *peripheral) connectionDone() <-chan struct{} {
@@ -454,37 +470,37 @@ func (p *peripheral) closedError() error {
 }
 
 func (p *peripheral) sendCmd(op byte, b []byte) error {
-	_, err := p.send(op, b, true)
-	return err
+	return p.send(op, b, true).err
 }
 
 func (p *peripheral) sendReq(op byte, b []byte) ([]byte, error) {
-	return p.send(op, b, false)
+	result := p.send(op, b, false)
+	return result.b, result.err
 }
 
-func (p *peripheral) send(op byte, b []byte, noRsp bool) ([]byte, error) {
+func (p *peripheral) send(op byte, b []byte, noRsp bool) peripheralResult {
 	if p.l2c == nil || p.reqc == nil || p.quitc == nil {
-		return nil, io.ErrClosedPipe
+		return peripheralResult{err: io.ErrClosedPipe}
 	}
 	if err := p.closedError(); err != nil {
-		return nil, err
+		return peripheralResult{err: err}
 	}
 	m := message{op: op, b: b, noRsp: noRsp, rspc: make(chan peripheralResult, 1)}
 	done := p.connectionDone()
 	select {
 	case <-p.quitc:
-		return nil, p.stopErr
+		return peripheralResult{err: p.stopErr}
 	case <-done:
-		return nil, p.closedError()
+		return peripheralResult{err: p.closedError()}
 	case p.reqc <- m:
 	}
 	select {
 	case <-p.quitc:
-		return nil, p.stopErr
+		return peripheralResult{err: p.stopErr}
 	case <-done:
-		return nil, p.closedError()
+		return peripheralResult{err: p.closedError()}
 	case result := <-m.rspc:
-		return result.b, result.err
+		return result
 	}
 }
 
@@ -503,6 +519,7 @@ func (p *peripheral) requestLoop(rspc <-chan []byte) {
 		if err := p.closedError(); err != nil {
 			return
 		}
+		result := peripheralResult{mtu: p.mtu}
 		n, err := p.l2c.Write(req.b)
 		if err == nil && n != len(req.b) {
 			err = io.ErrShortWrite
@@ -511,7 +528,6 @@ func (p *peripheral) requestLoop(rspc <-chan []byte) {
 			p.abort(fmt.Errorf("write ATT operation 0x%02x: %w", req.op, err))
 			return
 		}
-		result := peripheralResult{}
 		if !req.noRsp {
 			select {
 			case <-p.quitc:
@@ -528,6 +544,10 @@ func (p *peripheral) requestLoop(rspc <-chan []byte) {
 			if result.b[0] == attOpError {
 				handle := binary.LittleEndian.Uint16(result.b[2:4])
 				result.err = fmt.Errorf("ATT operation 0x%02x at handle 0x%04x: %w", req.op, handle, attEcode(result.b[4]))
+			} else if req.op == attOpMtuReq {
+				clientMTU := binary.LittleEndian.Uint16(req.b[1:3])
+				serverMTU := binary.LittleEndian.Uint16(result.b[1:3])
+				p.mtu = min(clientMTU, serverMTU)
 			}
 		}
 		select {
@@ -660,14 +680,6 @@ func (p *peripheral) SetMTU(mtu uint16) error {
 	b[0] = op
 	binary.LittleEndian.PutUint16(b[1:3], uint16(mtu))
 
-	b, err := p.sendReq(op, b)
-	if err != nil {
-		return err
-	}
-	serverMTU := binary.LittleEndian.Uint16(b[1:3])
-	if serverMTU < mtu {
-		mtu = serverMTU
-	}
-	p.mtu = mtu
-	return nil
+	_, err := p.sendReq(op, b)
+	return err
 }

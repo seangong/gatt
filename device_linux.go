@@ -134,6 +134,7 @@ func (d *device) Init(f func(Device, State)) error {
 			d:       d,
 			pd:      pd,
 			l2c:     pd.Conn,
+			mtu:     attDefaultMTU,
 			reqc:    make(chan message),
 			quitc:   make(chan struct{}),
 			sub:     newSubscriber(),
@@ -155,7 +156,9 @@ func (d *device) Init(f func(Device, State)) error {
 	}
 	d.hci.AdvertisementHandler = func(pd *linux.PlatData) {
 		a := &Advertisement{}
-		a.unmarshall(pd.Data)
+		if err := a.unmarshall(pd.Data); err != nil {
+			return
+		}
 		a.Connectable = pd.Connectable
 		p := &peripheral{pd: pd, d: d}
 		if d.peripheralDiscovered != nil {
@@ -332,6 +335,9 @@ func (d *device) SetServices(s []*Service) error {
 }
 
 func (d *device) Advertise(a *AdvPacket) error {
+	if err := a.Err(); err != nil {
+		return err
+	}
 	d.advData = &cmd.LESetAdvertisingData{
 		AdvertisingDataLength: uint8(a.Len()),
 		AdvertisingData:       a.Bytes(),
