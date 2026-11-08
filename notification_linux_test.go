@@ -157,7 +157,10 @@ func TestNotifierCapacityAfterMTU(t *testing.T) {
 	for _, mtu := range []uint16{64, 32} {
 		var request [2]byte
 		binary.LittleEndian.PutUint16(request[:], mtu)
-		n.central.handleMTU(request[:])
+		if !n.central.handleAndRespond(append([]byte{attOpMtuReq}, request[:]...)) {
+			t.Error("MTU response was not sent")
+			return
+		}
 		if got := n.Cap(); got != int(mtu)-3 {
 			t.Fatalf("Cap() after MTU %d = %d, want %d", mtu, got, int(mtu)-3)
 		}
@@ -194,7 +197,10 @@ func TestNotifierConcurrentMTU(t *testing.T) {
 			}
 			var request [2]byte
 			binary.LittleEndian.PutUint16(request[:], mtu)
-			n.central.handleMTU(request[:])
+			if !n.central.handleAndRespond(append([]byte{attOpMtuReq}, request[:]...)) {
+				t.Error("MTU response was not sent")
+				return
+			}
 		}
 	}()
 	go func() {

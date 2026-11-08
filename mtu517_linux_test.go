@@ -24,10 +24,14 @@ func TestMTUNegotiationUpTo517(t *testing.T) {
 		{65535, 517},
 	} {
 		t.Run(fmt.Sprint(tt.requested), func(t *testing.T) {
-			c := newCentral(nil, nil, nil)
+			conn := &notificationTestConn{}
+			c := newCentral(nil, nil, conn)
 			request := []byte{attOpMtuReq, byte(tt.requested), byte(tt.requested >> 8)}
 			want := []byte{attOpMtuRsp, byte(tt.want), byte(tt.want >> 8)}
-			if got := c.handleReq(request); !bytes.Equal(got, want) {
+			if !c.handleAndRespond(request) {
+				t.Fatal("MTU response was not sent")
+			}
+			if got := conn.packets[0]; !bytes.Equal(got, want) {
 				t.Errorf("MTU response = %x, want %x", got, want)
 			}
 			if got := c.MTU(); got != int(tt.want) {
@@ -39,7 +43,10 @@ func TestMTUNegotiationUpTo517(t *testing.T) {
 
 func TestNotificationValueLimitAtMTU517(t *testing.T) {
 	n, conn := newNotificationTestNotifier(t)
-	n.central.handleReq([]byte{attOpMtuReq, 0x05, 0x02})
+	if !n.central.handleAndRespond([]byte{attOpMtuReq, 0x05, 0x02}) {
+		t.Fatal("MTU response was not sent")
+	}
+	conn.packets = nil
 	if got := n.Cap(); got != 512 {
 		t.Fatalf("Cap() at MTU 517 = %d, want 512", got)
 	}
@@ -80,8 +87,10 @@ func TestReadByTypeLengthAtMTU517(t *testing.T) {
 			} else {
 				characteristic.SetValue(value)
 			}
-			c := newCentral(generateAttributes([]*Service{service}, 0x1201), nil, nil)
-			c.handleReq([]byte{attOpMtuReq, 0x05, 0x02})
+			c := newCentral(generateAttributes([]*Service{service}, 0x1201), nil, &notificationTestConn{})
+			if !c.handleAndRespond([]byte{attOpMtuReq, 0x05, 0x02}) {
+				t.Fatal("MTU response was not sent")
+			}
 			handle := characteristic.VHandle()
 			request := []byte{attOpReadByTypeReq, byte(handle), byte(handle >> 8), byte(handle), byte(handle >> 8), 0x01, 0xff}
 			want := append([]byte{attOpReadByTypeRsp, 255, byte(handle), byte(handle >> 8)}, value[:253]...)
@@ -121,8 +130,10 @@ func TestReadValueCapacityAtMTU517(t *testing.T) {
 					t.Errorf("write read response: %v", err)
 				}
 			})
-			c := newCentral(generateAttributes([]*Service{service}, 0x1201), nil, nil)
-			c.handleReq([]byte{attOpMtuReq, 0x05, 0x02})
+			c := newCentral(generateAttributes([]*Service{service}, 0x1201), nil, &notificationTestConn{})
+			if !c.handleAndRespond([]byte{attOpMtuReq, 0x05, 0x02}) {
+				t.Fatal("MTU response was not sent")
+			}
 			handle := characteristic.VHandle()
 			request := []byte{tt.opcode, byte(handle), byte(handle >> 8)}
 			if tt.opcode == attOpReadBlobReq {
@@ -152,8 +163,10 @@ func TestWriteValueLimitAtMTU517(t *testing.T) {
 					written = append([]byte(nil), data...)
 					return StatusSuccess
 				})
-				c := newCentral(generateAttributes([]*Service{service}, 0x1201), nil, nil)
-				c.handleReq([]byte{attOpMtuReq, 0x05, 0x02})
+				c := newCentral(generateAttributes([]*Service{service}, 0x1201), nil, &notificationTestConn{})
+				if !c.handleAndRespond([]byte{attOpMtuReq, 0x05, 0x02}) {
+					t.Fatal("MTU response was not sent")
+				}
 				handle := characteristic.VHandle()
 				payload := bytes.Repeat([]byte{0x5a}, size)
 				request := append([]byte{opcode, byte(handle), byte(handle >> 8)}, payload...)

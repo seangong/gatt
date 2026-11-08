@@ -5,11 +5,12 @@ import "log"
 // attr is a BLE attribute. It is not exported;
 // managing attributes is an implementation detail.
 type attr struct {
-	h      uint16   // attribute handle
-	typ    UUID     // attribute type in UUID
-	props  Property // attripute property
-	secure Property // attribute secure (implementation specific usage)
-	value  []byte   // attribute value
+	h        uint16   // attribute handle
+	nativeID int      // Opaque local attribute ID used by the macOS backend.
+	typ      UUID     // attribute type in UUID
+	props    Property // attripute property
+	secure   Property // attribute secure (implementation specific usage)
+	value    []byte   // attribute value
 
 	pvt interface{} // point to the corresponsing Serveice/Characteristic/Descriptor
 }

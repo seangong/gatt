@@ -199,6 +199,14 @@ for its disconnection callback before reconnecting to the same device; other
 connections remain usable.
 Failed subscription changes preserve the previous callback.
 
+On macOS, `RemoveAllServices` releases the local attribute registrations and
+stops their notifiers after the removal command is queued locally. Old notifiers
+then reject writes. Success does not confirm that the system has completed the
+removal. `SetServices` applies services in order; if an add fails, services
+already added by that call remain. An add failure releases only its own local
+registrations. Notification handlers should observe `Notifier.Done()` when a
+subscription or service is removed.
+
 ## Minimal Linux server
 
 Save this as `main.go` in your application module after installing a snapshot
@@ -360,6 +368,15 @@ local value is rejected without sending a request. A peer MTU below 23 leaves
 the effective MTU at the default 23; a larger peer value is bounded by the local
 request. These bounds describe this implementation's supported receive size.
 
+Linux also validates received ATT PDU sizes against the effective MTU. A server
+rejects an oversized request before calling business handlers and silently
+discards oversized commands. An oversized client response retires that bearer
+with an error matching `ErrInvalidLength` and releases queued operations.
+Oversized notifications are discarded; oversized indications are confirmed and
+discarded without delivering their values. MTU changes take effect in protocol
+order so notifications following an exchange use the negotiated size. These
+checks apply to each PDU and do not change cumulative long-read behavior.
+
 After a complete ATT request is sent, the Linux client waits up to 30 seconds
 for its response. Timeout errors match `context.DeadlineExceeded`; the bearer
 is closed and queued operations are released. Establish a new connection before
@@ -396,6 +413,13 @@ provide the same shutdown contract.
 `Scan`, `Connect` and `CancelConnection` do not return errors through the portable
 `Device` interface. Returning from a call is not a connection-success signal;
 observe completion callbacks and use application-level timeouts where needed.
+
+For Linux outgoing connections, command rejection, connection failure and setup
+failure are reported through `PeripheralConnected` with the original request
+object and a non-nil error. That object does not represent a usable connection.
+Explicit cancellation and normal shutdown suppress pending connection callbacks.
+Low-level HCI callers can use `ConnectWithResult` to receive one buffered result;
+the existing HCI `Connect` return value and success handler remain unchanged.
 
 ## Repository examples
 

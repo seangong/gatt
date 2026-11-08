@@ -89,12 +89,16 @@ type connectionAttempt struct {
 	cancelStarted bool
 	cancelDone    chan struct{}
 	cancelErr     error
+	result        chan ConnectionResult
+	resultDone    bool
+	withResult    bool
 }
 
 func newConnectionAttempt(pd *PlatData) *connectionAttempt {
 	return &connectionAttempt{
 		source: pd, address: pd.Address, addressType: pd.AddressType,
 		createDone: make(chan struct{}), done: make(chan struct{}), cancelDone: make(chan struct{}),
+		result: make(chan ConnectionResult, 1),
 	}
 }
 
@@ -201,7 +205,18 @@ func (h *HCI) requestClose(cause error) <-chan struct{} {
 	}
 	h.closed = true
 	h.c.BeginShutdown()
+	resultErr := h.closeCause
+	if resultErr == nil {
+		resultErr = context.Canceled
+	}
+	if h.pending != nil {
+		h.pending.finishResult(nil, resultErr)
+	}
 	for _, c := range h.conns {
+		if h.closeCause == nil {
+			c.intentionalClose = true
+		}
+		c.finishConnect(resultErr)
 		c.stop()
 	}
 	done := h.closeDone
@@ -281,6 +296,11 @@ func (h *HCI) closeTransport() {
 		if a := h.pending; a != nil {
 			a.created()
 			a.complete(nil, io.ErrClosedPipe)
+			resultErr := h.closeCause
+			if resultErr == nil {
+				resultErr = context.Canceled
+			}
+			a.finishResult(nil, resultErr)
 			h.pending = nil
 		}
 		for handle, c := range h.conns {
@@ -444,16 +464,22 @@ func (h *HCI) SetScanEnable(en bool, dup bool) error {
 }
 
 func (h *HCI) Connect(pd *PlatData) error {
+	_, err := h.connect(pd, false)
+	return err
+}
+
+func (h *HCI) connect(pd *PlatData, withResult bool) (*connectionAttempt, error) {
 	h.connsmu.Lock()
 	if h.closed {
 		h.connsmu.Unlock()
-		return io.ErrClosedPipe
+		return nil, io.ErrClosedPipe
 	}
 	if h.pending != nil {
 		h.connsmu.Unlock()
-		return errors.New("hci: connection attempt already pending")
+		return nil, errors.New("hci: connection attempt already pending")
 	}
 	a := newConnectionAttempt(pd)
+	a.withResult = withResult
 	h.pending = a
 	h.connsmu.Unlock()
 	// Keep the caller's parsed name without sharing mutable advertisement data.
@@ -477,10 +503,16 @@ func (h *HCI) Connect(pd *PlatData) error {
 			MinimumCELength:       0x0000,         // N x 0.625ms
 			MaximumCELength:       0x0000,         // N x 0.625ms
 		})
+	var abortConn *conn
 	h.connsmu.Lock()
 	a.created()
 	if err != nil {
 		a.complete(nil, nil)
+		if a.finishResult(nil, err) && a.conn != nil {
+			// An early physical completion can race a rejected command status.
+			// A failed result must not subsequently publish that connection.
+			abortConn = a.conn
+		}
 		if h.pending == a && !a.cancelStarted {
 			h.pending = nil
 		}
@@ -491,7 +523,10 @@ func (h *HCI) Connect(pd *PlatData) error {
 	default:
 	}
 	h.connsmu.Unlock()
-	return err
+	if abortConn != nil {
+		abortConn.Abort(err)
+	}
+	return a, err
 }
 
 func (h *HCI) CancelConnection(pd *PlatData) error {
@@ -507,6 +542,14 @@ func (h *HCI) CancelConnection(pd *PlatData) error {
 		if c.origin == pd {
 			target = c
 			break
+		}
+	}
+	if c, ok := target.(*conn); ok && h.conns[c.attr] == c {
+		select {
+		case <-c.done:
+		default:
+			c.intentionalClose = true
+			c.finishConnect(context.Canceled)
 		}
 	}
 	h.connsmu.Unlock()
@@ -531,6 +574,7 @@ func (h *HCI) cancelPendingConnection(ctx context.Context, a *connectionAttempt)
 		}
 	}
 	a.cancelStarted = true
+	a.finishResult(nil, context.Canceled)
 	h.connsmu.Unlock()
 
 	// Context cancellation alone cannot interrupt the command's device Write.
@@ -867,6 +911,15 @@ func (h *HCI) handleConnection(b []byte) {
 	if ep.Status != 0 || h.transportClosed || h.closeCause != nil {
 		if matches {
 			a.complete(nil, nil)
+			resultErr := h.closeCause
+			if resultErr == nil {
+				if ep.Status != 0 {
+					resultErr = fmt.Errorf("LE Create Connection failed: HCI status 0x%02x", ep.Status)
+				} else {
+					resultErr = io.ErrClosedPipe
+				}
+			}
+			a.finishResult(nil, resultErr)
 			if !a.cancelStarted {
 				h.pending = nil
 			}
@@ -889,6 +942,7 @@ func (h *HCI) handleConnection(b []byte) {
 	canceling := false
 	if matches {
 		c.origin = a.source
+		c.attempt = a
 		a.complete(c, nil)
 		canceling = a.cancelStarted
 		if !canceling {
@@ -936,9 +990,25 @@ func (h *HCI) handleConnection(b []byte) {
 			pd.Conn = c
 		}
 		h.plistmu.Unlock()
+		if matches && a.withResult {
+			h.connsmu.Lock()
+			if c.attempt == a && !a.resultDone {
+				a.finishResult(pd, nil)
+				c.attempt = nil
+			}
+			h.connsmu.Unlock()
+			return
+		}
 		if h.AcceptSlaveHandler != nil && !h.callout(func() { h.AcceptSlaveHandler(pd) }) {
 			c.Abort(errors.New("connection callback capacity exhausted"))
+			return
 		}
+		h.connsmu.Lock()
+		if c.attempt == a && a != nil {
+			a.finishResult(pd, nil)
+			c.attempt = nil
+		}
+		h.connsmu.Unlock()
 	})
 }
 

@@ -2,6 +2,7 @@ package gatt
 
 import (
 	"context"
+	"io"
 	"sync"
 
 	"github.com/seangong/gatt/v2/xpc"
@@ -11,7 +12,7 @@ type central struct {
 	dev         *device
 	uuid        UUID
 	mtu         int
-	notifiers   map[uint16]*notifier
+	notifiers   map[int]*notifier
 	notifiersmu *sync.Mutex
 }
 
@@ -20,7 +21,7 @@ func newCentral(d *device, u UUID) *central {
 		dev:         d,
 		mtu:         23,
 		uuid:        u,
-		notifiers:   make(map[uint16]*notifier),
+		notifiers:   make(map[int]*notifier),
 		notifiersmu: &sync.Mutex{},
 	}
 }
@@ -38,7 +39,16 @@ func (c *central) sendNotification(n *notifier, b []byte) (int, error) {
 	a := n.a
 	data := make([]byte, len(b))
 	copy(data, b) // have to make a copy, why?
-	if err := c.dev.sendCmd(15, xpc.Dict{
+	c.dev.attrmu.RLock()
+	if err := context.Cause(c.dev.ctx); err != nil {
+		c.dev.attrmu.RUnlock()
+		return 0, err
+	}
+	if n.Done() {
+		c.dev.attrmu.RUnlock()
+		return 0, io.ErrClosedPipe
+	}
+	err := c.dev.conn.SendError(xpc.Dict{"kCBMsgId": 15, "kCBMsgArgs": xpc.Dict{
 		// "kCBMsgArgUUIDs": [][]byte{reverse(c.uuid.b)}, // connection interrupted
 		// "kCBMsgArgUUIDs": [][]byte{c.uuid.b}, // connection interrupted
 		// "kCBMsgArgUUIDs": []xpc.UUID{xpc.UUID(reverse(c.uuid.b))},
@@ -49,10 +59,13 @@ func (c *central) sendNotification(n *notifier, b []byte) (int, error) {
 		// So, broadcast to all subscribed centrals. Either of the following works.
 		// "kCBMsgArgUUIDs": []xpc.UUID{},
 		"kCBMsgArgUUIDs":       [][]byte{},
-		"kCBMsgArgAttributeID": a.h,
+		"kCBMsgArgAttributeID": a.nativeID,
 		"kCBMsgArgData":        data,
-	}); err != nil {
-		return 0, err
+	}}, false)
+	c.dev.attrmu.RUnlock()
+	if err != nil {
+		c.dev.fail(err)
+		return 0, context.Cause(c.dev.ctx)
 	}
 	return len(b), nil
 }
@@ -63,11 +76,11 @@ func (c *central) startNotify(a *attr, maxlen int) {
 	if context.Cause(c.dev.ctx) != nil {
 		return
 	}
-	if _, found := c.notifiers[a.h]; found {
+	if _, found := c.notifiers[a.nativeID]; found {
 		return
 	}
 	n := newNotifier(c, a, maxlen)
-	c.notifiers[a.h] = n
+	c.notifiers[a.nativeID] = n
 	char := a.pvt.(*Characteristic)
 	go char.nhandler.ServeNotify(Request{Central: c}, n)
 }
@@ -75,9 +88,9 @@ func (c *central) startNotify(a *attr, maxlen int) {
 func (c *central) stopNotify(a *attr) {
 	c.notifiersmu.Lock()
 	defer c.notifiersmu.Unlock()
-	if n, found := c.notifiers[a.h]; found {
+	if n, found := c.notifiers[a.nativeID]; found {
 		n.stop()
-		delete(c.notifiers, a.h)
+		delete(c.notifiers, a.nativeID)
 	}
 }
 

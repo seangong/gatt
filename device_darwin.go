@@ -179,7 +179,44 @@ func (d *device) StopAdvertising() error {
 }
 
 func (d *device) RemoveAllServices() error {
-	return d.sendCmd(12, nil)
+	d.attrmu.Lock()
+	if err := context.Cause(d.ctx); err != nil {
+		d.attrmu.Unlock()
+		return err
+	}
+	// Local enqueue and retirement share one boundary with subscriptions and
+	// notification sends. Native removal has no acknowledgement event.
+	err := d.conn.SendError(xpc.Dict{"kCBMsgId": 12, "kCBMsgArgs": xpc.Dict{}}, false)
+	if err == nil {
+		d.attrs = make(map[int]*attr)
+		d.stopServiceNotifiersLocked(nil)
+	}
+	d.attrmu.Unlock()
+	if err != nil {
+		d.fail(err)
+		return context.Cause(d.ctx)
+	}
+	return nil
+}
+
+// stopServiceNotifiersLocked requires attrmu. A nil set retires every notifier;
+// otherwise only notifiers belonging to the supplied attribute records stop.
+func (d *device) stopServiceNotifiersLocked(removed map[int]*attr) {
+	d.subscribersmu.Lock()
+	defer d.subscribersmu.Unlock()
+	for uuid, c := range d.subscribers {
+		c.notifiersmu.Lock()
+		for id, n := range c.notifiers {
+			if removed == nil || removed[id] == n.a {
+				n.stop()
+				delete(c.notifiers, id)
+			}
+		}
+		if len(c.notifiers) == 0 {
+			delete(d.subscribers, uuid)
+		}
+		c.notifiersmu.Unlock()
+	}
 }
 
 func (d *device) AddService(s *Service) error {
@@ -191,93 +228,128 @@ func (d *device) AddService(s *Service) error {
 		return nil
 	}
 
-	d.attrmu.Lock()
-	xs := xpc.Dict{
-		"kCBMsgArgAttributeID":     d.attrN,
-		"kCBMsgArgAttributeIDs":    []int{},
-		"kCBMsgArgCharacteristics": nil,
-		"kCBMsgArgType":            1, // 1 => primary, 0 => excluded
-		"kCBMsgArgUUID":            reverse(s.uuid.b),
-	}
-	d.attrN++
-
-	xcs := xpc.Array{}
-	for _, c := range s.Characteristics() {
-		props := 0
-		perm := 0
-		if c.props&CharRead != 0 {
-			props |= 0x02
-			if CharRead&c.secure != 0 {
-				perm |= 0x04
-			} else {
-				perm |= 0x01
-			}
+	var added map[int]*attr
+	rsp, err := d.requests.request(d.ctx, 18, func() error {
+		d.attrmu.Lock()
+		if err := context.Cause(d.ctx); err != nil {
+			d.attrmu.Unlock()
+			return err
 		}
-		if c.props&CharWriteNR != 0 {
-			props |= 0x04
-			if c.secure&CharWriteNR != 0 {
-				perm |= 0x08
-			} else {
-				perm |= 0x02
-			}
+		added = make(map[int]*attr, len(s.Characteristics()))
+		xs := xpc.Dict{
+			"kCBMsgArgAttributeID":     d.attrN,
+			"kCBMsgArgAttributeIDs":    []int{},
+			"kCBMsgArgCharacteristics": nil,
+			"kCBMsgArgType":            1, // 1 => primary, 0 => excluded
+			"kCBMsgArgUUID":            reverse(s.uuid.b),
 		}
-		if c.props&CharWrite != 0 {
-			props |= 0x08
-			if c.secure&CharWrite != 0 {
-				perm |= 0x08
-			} else {
-				perm |= 0x02
-			}
-		}
-		if c.props&CharNotify != 0 {
-			if c.secure&CharNotify != 0 {
-				props |= 0x100
-			} else {
-				props |= 0x10
-			}
-		}
-		if c.props&CharIndicate != 0 {
-			if c.secure&CharIndicate != 0 {
-				props |= 0x200
-			} else {
-				props |= 0x20
-			}
-		}
-
-		xc := xpc.Dict{
-			"kCBMsgArgAttributeID":              d.attrN,
-			"kCBMsgArgUUID":                     reverse(c.uuid.b),
-			"kCBMsgArgAttributePermissions":     perm,
-			"kCBMsgArgCharacteristicProperties": props,
-			"kCBMsgArgData":                     c.value,
-		}
-		d.attrs[d.attrN] = &attr{h: uint16(d.attrN), value: c.value, pvt: c}
 		d.attrN++
 
-		xds := xpc.Array{}
-		for _, d := range c.Descriptors() {
-			if d.uuid.Equal(attrClientCharacteristicConfigUUID) {
-				// skip CCCD
-				continue
+		xcs := xpc.Array{}
+		for _, c := range s.Characteristics() {
+			props := 0
+			perm := 0
+			if c.props&CharRead != 0 {
+				props |= 0x02
+				if CharRead&c.secure != 0 {
+					perm |= 0x04
+				} else {
+					perm |= 0x01
+				}
 			}
-			xd := xpc.Dict{
-				"kCBMsgArgData": d.value,
-				"kCBMsgArgUUID": reverse(d.uuid.b),
+			if c.props&CharWriteNR != 0 {
+				props |= 0x04
+				if c.secure&CharWriteNR != 0 {
+					perm |= 0x08
+				} else {
+					perm |= 0x02
+				}
 			}
-			xds = append(xds, xd)
-		}
-		xc["kCBMsgArgDescriptors"] = xds
-		xcs = append(xcs, xc)
-	}
-	xs["kCBMsgArgCharacteristics"] = xcs
+			if c.props&CharWrite != 0 {
+				props |= 0x08
+				if c.secure&CharWrite != 0 {
+					perm |= 0x08
+				} else {
+					perm |= 0x02
+				}
+			}
+			if c.props&CharNotify != 0 {
+				if c.secure&CharNotify != 0 {
+					props |= 0x100
+				} else {
+					props |= 0x10
+				}
+			}
+			if c.props&CharIndicate != 0 {
+				if c.secure&CharIndicate != 0 {
+					props |= 0x200
+				} else {
+					props |= 0x20
+				}
+			}
 
-	d.attrmu.Unlock()
-	rsp, err := d.sendReq(10, xs)
-	if err != nil {
-		return err
+			xc := xpc.Dict{
+				"kCBMsgArgAttributeID":              d.attrN,
+				"kCBMsgArgUUID":                     reverse(c.uuid.b),
+				"kCBMsgArgAttributePermissions":     perm,
+				"kCBMsgArgCharacteristicProperties": props,
+				"kCBMsgArgData":                     c.value,
+			}
+			added[d.attrN] = &attr{h: uint16(d.attrN), nativeID: d.attrN, value: c.value, pvt: c}
+			d.attrN++
+
+			xds := xpc.Array{}
+			for _, d := range c.Descriptors() {
+				if d.uuid.Equal(attrClientCharacteristicConfigUUID) {
+					// skip CCCD
+					continue
+				}
+				xd := xpc.Dict{
+					"kCBMsgArgData": d.value,
+					"kCBMsgArgUUID": reverse(d.uuid.b),
+				}
+				xds = append(xds, xd)
+			}
+			xc["kCBMsgArgDescriptors"] = xds
+			xcs = append(xcs, xc)
+		}
+		xs["kCBMsgArgCharacteristics"] = xcs
+
+		// Publish only when this request actually enters the native send queue.
+		// The registry lock is released before waiting for event 18.
+		err := d.conn.SendError(xpc.Dict{"kCBMsgId": 10, "kCBMsgArgs": xs}, false)
+		if err == nil {
+			for id, a := range added {
+				d.attrs[id] = a
+			}
+		}
+		d.attrmu.Unlock()
+		if err != nil {
+			d.fail(err)
+			return context.Cause(d.ctx)
+		}
+		return nil
+	})
+	if err == nil {
+		result, ok := rsp["kCBMsgArgResult"].(int64)
+		if !ok {
+			err = fmt.Errorf("invalid native AddService result: %w", ErrInvalidLength)
+		} else if result != 0 {
+			err = fmt.Errorf("native AddService result %d", result)
+		}
 	}
-	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
-		return errors.New("FIXME: Add Srvice error")
+	if err != nil {
+		d.attrmu.Lock()
+		for id, a := range added {
+			if d.attrs[id] == a {
+				delete(d.attrs, id)
+			}
+		}
+		if added != nil {
+			d.stopServiceNotifiersLocked(added)
+		}
+		d.attrmu.Unlock()
+		return fmt.Errorf("add service: %w", err)
 	}
 	return nil
 }
@@ -483,8 +555,8 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 		a := args.MustGetInt("kCBMsgArgAttributeID")
 		d.attrmu.RLock()
 		attr := d.attrs[a]
-		d.attrmu.RUnlock()
 		if attr == nil {
+			d.attrmu.RUnlock()
 			return
 		}
 		d.subscribersmu.Lock()
@@ -495,6 +567,7 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 		}
 		d.subscribersmu.Unlock()
 		c.startNotify(attr, c.mtu)
+		d.attrmu.RUnlock()
 
 	case 22: // unubscribed
 		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}

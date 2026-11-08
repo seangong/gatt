@@ -30,6 +30,7 @@ type central struct {
 	handlerBusy   chan struct{}
 	requestSlots  chan struct{}
 	callbackSlots chan struct{}
+	sendGate      chan struct{}
 	notifiers     map[uint16]*notifier
 	notifiersmu   *sync.Mutex
 	indication    *pendingIndication // Protected by notifiersmu.
@@ -58,6 +59,7 @@ func newCentral(a *attrRange, addr net.HardwareAddr, l2conn io.ReadWriteCloser) 
 		handlerBusy:   make(chan struct{}, 1),
 		requestSlots:  make(chan struct{}, 1),
 		callbackSlots: make(chan struct{}, 16),
+		sendGate:      make(chan struct{}, 1),
 		notifiers:     make(map[uint16]*notifier),
 		notifiersmu:   &sync.Mutex{},
 	}
@@ -154,10 +156,8 @@ func (c *central) loop() {
 				if c.ctx.Err() != nil {
 					return
 				}
-				if rsp := c.handleReq(request); rsp != nil && c.ctx.Err() == nil {
-					if n, err := c.l2conn.Write(rsp); err != nil || n != len(rsp) {
-						return
-					}
+				if !c.handleAndRespond(request) {
+					return
 				}
 			}
 		}
@@ -188,6 +188,56 @@ func (c *central) loop() {
 	}
 }
 
+func (c *central) lockSend() bool {
+	select {
+	case <-c.ctx.Done():
+		return false
+	case c.sendGate <- struct{}{}:
+	}
+	if c.ctx.Err() != nil {
+		c.unlockSend()
+		return false
+	}
+	return true
+}
+
+func (c *central) unlockSend() { <-c.sendGate }
+
+// An MTU response and its effective size are published in wire order with
+// notifications. Ordinary handlers run outside the send gate: they may write
+// a notification themselves or wait for a confirmation.
+func (c *central) handleAndRespond(request []byte) bool {
+	exchange := len(request) != 0 && request[0] == attOpMtuReq
+	if exchange {
+		if !c.lockSend() {
+			return false
+		}
+		defer c.unlockSend()
+	}
+	rsp := c.handleReq(request)
+	if c.ctx.Err() != nil {
+		return false
+	}
+	if rsp == nil {
+		return true
+	}
+	if !exchange {
+		if !c.lockSend() {
+			return false
+		}
+		defer c.unlockSend()
+	}
+	if n, err := c.l2conn.Write(rsp); err != nil || n != len(rsp) {
+		return false
+	}
+	if exchange && rsp[0] == attOpMtuRsp {
+		c.mtuMu.Lock()
+		c.mtu = binary.LittleEndian.Uint16(rsp[1:3])
+		c.mtuMu.Unlock()
+	}
+	return true
+}
+
 // handleReq dispatches a raw request from the central shim
 // to an appropriate handler, based on its type.
 func (c *central) handleReq(b []byte) []byte {
@@ -200,6 +250,12 @@ func (c *central) handleReq(b []byte) []byte {
 			c.confirmIndication()
 		}
 		return nil
+	}
+	if len(b) > c.MTU() {
+		if reqType&0x40 != 0 { // The command flag forbids an ATT response.
+			return nil
+		}
+		return attErrorRsp(reqType, 0, attEcodeInvalidPDU)
 	}
 	if !validATTParamLength(reqType, len(req)) {
 		if reqType == attOpWriteCmd {
@@ -269,9 +325,6 @@ func (c *central) handleMTU(b []byte) []byte {
 	if mtu > attMaxMTU {
 		mtu = attMaxMTU
 	}
-	c.mtuMu.Lock()
-	c.mtu = mtu
-	c.mtuMu.Unlock()
 	return []byte{attOpMtuRsp, uint8(mtu), uint8(mtu >> 8)}
 }
 
@@ -616,6 +669,10 @@ func (c *central) handleWrite(reqType byte, b []byte) []byte {
 }
 
 func (c *central) sendNotification(n *notifier, data []byte) (int, error) {
+	if !c.lockSend() {
+		return 0, io.ErrClosedPipe
+	}
+	defer c.unlockSend()
 	mtu := uint16(c.MTU())
 	if len(data) > min(int(mtu)-3, attMaxValueLen) {
 		return 0, io.ErrShortWrite

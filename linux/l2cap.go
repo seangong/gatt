@@ -40,23 +40,25 @@ func (a *aclData) unmarshal(b []byte) error {
 }
 
 type conn struct {
-	hci            *HCI
-	attr           uint16
-	origin         *PlatData // Original Connect argument, protected by hci.connsmu.
-	aclc           chan []byte
-	done           chan struct{}
-	disconnecting  bool // Protected by hci.connsmu.
-	disconnectDone chan struct{}
-	disconnectErr  error  // Published by closing disconnectDone.
-	rxPDU          []byte // Partial L2CAP PDU, protected by hci.connsmu.
-	linkDone       chan struct{}
-	linkClosed     bool  // Protected by hci.connsmu.
-	linkErr        error // Published by closing linkDone.
-	ctx            context.Context
-	cancel         context.CancelFunc
-	writeGate      chan struct{}
-	aclOutstanding int             // Protected by hci.connsmu.
-	aclReserved    *aclReservation // Protected by hci.connsmu.
+	hci              *HCI
+	attr             uint16
+	origin           *PlatData // Original Connect argument, protected by hci.connsmu.
+	aclc             chan []byte
+	done             chan struct{}
+	disconnecting    bool // Protected by hci.connsmu.
+	disconnectDone   chan struct{}
+	disconnectErr    error  // Published by closing disconnectDone.
+	rxPDU            []byte // Partial L2CAP PDU, protected by hci.connsmu.
+	linkDone         chan struct{}
+	linkClosed       bool  // Protected by hci.connsmu.
+	linkErr          error // Published by closing linkDone.
+	ctx              context.Context
+	cancel           context.CancelFunc
+	writeGate        chan struct{}
+	aclOutstanding   int                // Protected by hci.connsmu.
+	aclReserved      *aclReservation    // Protected by hci.connsmu.
+	attempt          *connectionAttempt // Setup result, protected by hci.connsmu.
+	intentionalClose bool               // Explicit cancellation, protected by hci.connsmu.
 }
 
 func newConn(hci *HCI, hh uint16) *conn {
@@ -75,6 +77,7 @@ func newConn(hci *HCI, hh uint16) *conn {
 // stop must be called with hci.connsmu held. The receive queue stays open;
 // done wakes blocked readers and writers without racing with packet delivery.
 func (c *conn) stop() {
+	c.finishConnect(io.ErrClosedPipe)
 	c.rxPDU = nil
 	c.cancel()
 	select {
@@ -86,8 +89,19 @@ func (c *conn) stop() {
 
 func (c *conn) Context() context.Context { return c.ctx }
 
+// ConnectionCanceled reports explicit cancellation rather than a remote or
+// transport failure. It lets the adapter distinguish an early canceled connect.
+func (c *conn) ConnectionCanceled() bool {
+	c.hci.connsmu.Lock()
+	defer c.hci.connsmu.Unlock()
+	return c.intentionalClose
+}
+
 // Abort stops this connection without waiting for the caller's protocol loop.
 func (c *conn) Abort(cause error) {
+	if cause == nil {
+		cause = io.ErrClosedPipe
+	}
 	h := c.hci
 	h.connsmu.Lock()
 	select {
@@ -96,6 +110,7 @@ func (c *conn) Abort(cause error) {
 		return
 	default:
 	}
+	c.finishConnect(cause)
 	c.stop()
 	h.connsmu.Unlock()
 	log.Printf("l2conn: aborting handle 0x%04X: %v", c.attr, cause)
@@ -286,6 +301,12 @@ func (c *conn) disconnect(ctx context.Context) error {
 		}
 	}
 	c.disconnecting = true
+	select {
+	case <-c.done:
+	default:
+		c.intentionalClose = true
+		c.finishConnect(context.Canceled)
+	}
 	c.stop()
 	h.connsmu.Unlock()
 

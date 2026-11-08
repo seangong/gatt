@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"sync"
 
@@ -129,32 +130,10 @@ func (d *device) Init(f func(Device, State)) error {
 		}, func() error {
 			stopCancel()
 			return c.Close()
-		})
+		}, nil)
 	}
 	d.hci.AcceptSlaveHandler = func(pd *linux.PlatData) {
-		p := &peripheral{
-			d:       d,
-			pd:      pd,
-			l2c:     pd.Conn,
-			mtu:     attDefaultMTU,
-			reqc:    make(chan message),
-			quitc:   make(chan struct{}),
-			sub:     newSubscriber(),
-			callout: d.startCallback,
-		}
-		ctx := d.ctx
-		if conn, ok := pd.Conn.(interface{ Context() context.Context }); ok {
-			ctx = conn.Context()
-		}
-		d.runConnection(ctx, false, func() {
-			if d.peripheralConnected != nil {
-				d.peripheralConnected(p, nil)
-			}
-		}, p.loop, func() {
-			if d.peripheralDisconnected != nil {
-				d.peripheralDisconnected(p, nil)
-			}
-		}, pd.Conn.Close)
+		d.acceptPeripheral(pd, nil)
 	}
 	d.hci.AdvertisementHandler = func(pd *linux.PlatData) {
 		a := &Advertisement{}
@@ -191,7 +170,7 @@ func (d *device) startCallback(f func()) bool {
 
 // runConnection separates cancelable protocol work from ordered application
 // callbacks. A stuck callback retains its lifecycle slot after disconnection.
-func (d *device) runConnection(ctx context.Context, waitConnected bool, connected, run, disconnected func(), closeConn func() error) {
+func (d *device) runConnection(ctx context.Context, waitConnected bool, connected, run, disconnected func(), closeConn func() error, failed func(error)) {
 	d.mu.Lock()
 	if d.stopping {
 		d.mu.Unlock()
@@ -200,8 +179,12 @@ func (d *device) runConnection(ctx context.Context, waitConnected bool, connecte
 	select {
 	case d.lifecycleSlots <- struct{}{}:
 	default:
-		d.workers.Go(func() { _ = closeConn() })
+		d.workers.Add(1)
 		d.mu.Unlock()
+		if failed != nil {
+			failed(errors.New("connection lifecycle callback capacity exhausted"))
+		}
+		go func() { defer d.workers.Done(); _ = closeConn() }()
 		return
 	}
 	d.workers.Add(1)
@@ -229,7 +212,13 @@ func (d *device) runConnection(ctx context.Context, waitConnected bool, connecte
 	}()
 	go func() {
 		defer func() { <-d.lifecycleSlots }()
-		if ctx.Err() != nil || d.ctx.Err() != nil {
+		if d.ctx.Err() != nil {
+			return
+		}
+		if ctx.Err() != nil {
+			if failed != nil {
+				failed(io.ErrClosedPipe)
+			}
 			return
 		}
 		connected()
@@ -409,7 +398,87 @@ func (d *device) StopScanning() {
 }
 
 func (d *device) Connect(p Peripheral) {
-	d.hci.Connect(p.(*peripheral).pd)
+	d.connectionResult(p, d.hci.ConnectWithResult(p.(*peripheral).pd))
+}
+
+func (d *device) connectionResult(source Peripheral, result <-chan linux.ConnectionResult) {
+	consume := func(outcome linux.ConnectionResult) {
+		if outcome.Err != nil {
+			d.connectionFailure(source, outcome.Err)
+			return
+		}
+		d.acceptPeripheral(outcome.Peripheral, source)
+	}
+	select {
+	case outcome := <-result:
+		consume(outcome)
+	default:
+		go func() {
+			select {
+			case <-d.ctx.Done():
+			case outcome := <-result:
+				consume(outcome)
+			}
+		}()
+	}
+}
+
+func (d *device) connectionFailure(source Peripheral, err error) {
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	d.mu.Lock()
+	if d.stopping || d.peripheralConnected == nil {
+		d.mu.Unlock()
+		return
+	}
+	f := d.peripheralConnected
+	accepted := startCallout(d.callbackSlots, func() { f(source, err) })
+	d.mu.Unlock()
+	if !accepted {
+		log.Printf("gatt: connection failure callback capacity exhausted for %s: %v", source.ID(), err)
+	}
+}
+
+func (d *device) acceptPeripheral(pd *linux.PlatData, source Peripheral) {
+	if pd == nil || pd.Conn == nil {
+		if source != nil {
+			d.connectionFailure(source, io.ErrClosedPipe)
+		}
+		return
+	}
+	p := &peripheral{
+		d: d, pd: pd, l2c: pd.Conn, mtu: attDefaultMTU,
+		reqc: make(chan message), quitc: make(chan struct{}),
+		sub: newSubscriber(), callout: d.startCallback,
+	}
+	if source == nil {
+		source = p
+	}
+	ctx := d.ctx
+	if conn, ok := pd.Conn.(interface{ Context() context.Context }); ok {
+		ctx = conn.Context()
+	}
+	failed := func(err error) {
+		if conn, ok := pd.Conn.(interface{ ConnectionCanceled() bool }); ok && conn.ConnectionCanceled() {
+			return
+		}
+		if errors.Is(err, io.ErrClosedPipe) {
+			if cause := p.closedError(); cause != nil {
+				err = cause
+			}
+		}
+		d.connectionFailure(source, err)
+	}
+	d.runConnection(ctx, false, func() {
+		if d.peripheralConnected != nil {
+			d.peripheralConnected(p, nil)
+		}
+	}, p.loop, func() {
+		if d.peripheralDisconnected != nil {
+			d.peripheralDisconnected(p, nil)
+		}
+	}, pd.Conn.Close, failed)
 }
 
 func (d *device) CancelConnection(p Peripheral) {

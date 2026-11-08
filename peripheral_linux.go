@@ -588,7 +588,7 @@ func (p *peripheral) send(op byte, b []byte, noRsp bool) peripheralResult {
 	}
 }
 
-func (p *peripheral) requestLoop(rspc <-chan []byte) {
+func (p *peripheral) requestLoop(rspc <-chan []byte, processed chan<- uint16) {
 	done := p.connectionDone()
 	for {
 		var req message
@@ -642,7 +642,7 @@ func (p *peripheral) requestLoop(rspc <-chan []byte) {
 			case result.b = <-rspc:
 				timer.Stop()
 			}
-			if err := validPeripheralResponse(req.op, result.b); err != nil {
+			if err := validPeripheralResponse(req.op, result.b, result.mtu); err != nil {
 				p.abort(err)
 				return
 			}
@@ -656,6 +656,16 @@ func (p *peripheral) requestLoop(rspc <-chan []byte) {
 				if clientMTU >= attDefaultMTU && serverMTU >= attDefaultMTU {
 					p.mtu = min(clientMTU, serverMTU)
 				}
+			}
+			// The reader must apply this MTU before reading the next packet.
+			// A channel handoff alone does not mean the response was processed.
+			select {
+			case <-p.quitc:
+				return
+			case <-done:
+				p.stop(io.ErrClosedPipe)
+				return
+			case processed <- p.mtu:
 			}
 		}
 		select {
@@ -686,9 +696,12 @@ func validPeripheralRequest(op byte, b []byte, mtu uint16) error {
 	return nil
 }
 
-func validPeripheralResponse(op byte, b []byte) error {
+func validPeripheralResponse(op byte, b []byte, mtu uint16) error {
 	if len(b) == 0 {
 		return ErrInvalidLength
+	}
+	if len(b) > int(mtu) {
+		return fmt.Errorf("ATT response length %d exceeds transaction MTU %d: %w", len(b), mtu, ErrInvalidLength)
 	}
 	if b[0] == attOpError {
 		if len(b) != 5 {
@@ -718,17 +731,24 @@ func validPeripheralResponse(op byte, b []byte) error {
 }
 
 func (p *peripheral) loop() {
+	// After startup only requestLoop reads or changes p.mtu. The reader keeps a
+	// local size, synchronized after each response before receiving more PDUs.
+	receiveMTU := p.mtu
 	rspc := make(chan []byte)
+	processed := make(chan uint16)
 	pumpDone := make(chan struct{})
 	go func() {
 		defer close(pumpDone)
-		p.requestLoop(rspc)
+		p.requestLoop(rspc, processed)
 	}()
 	defer func() {
 		p.stop(io.EOF)
 		<-pumpDone
 	}()
+	p.readLoop(rspc, processed, receiveMTU)
+}
 
+func (p *peripheral) readLoop(rspc chan<- []byte, processed <-chan uint16, receiveMTU uint16) {
 	// L2CAP implementations shall support a minimum MTU size of 48 bytes.
 	// The default value is 672 bytes
 	buf := make([]byte, 672)
@@ -760,6 +780,13 @@ func (p *peripheral) loop() {
 				return
 			case rspc <- b:
 			}
+			select {
+			case <-p.quitc:
+				return
+			case <-p.connectionDone():
+				return
+			case receiveMTU = <-processed:
+			}
 			continue
 		}
 
@@ -768,19 +795,21 @@ func (p *peripheral) loop() {
 			return
 		}
 		h := binary.LittleEndian.Uint16(b[1:3])
-		f := p.sub.fn(h)
-		if f == nil {
-			log.Printf("notified by unsubscribed handle")
-			// FIXME: terminate the connection?
-		} else {
-			callback := func() { f(b[3:], nil) }
-			if p.callout != nil {
-				if !p.callout(callback) {
-					p.abort(errors.New("peripheral notification callback capacity exceeded"))
-					return
-				}
+		validValue := h != 0 && len(b) <= int(receiveMTU) && len(b)-3 <= attMaxValueLen
+		if validValue {
+			f := p.sub.fn(h)
+			if f == nil {
+				log.Printf("notified by unsubscribed handle")
 			} else {
-				go callback()
+				callback := func() { f(b[3:], nil) }
+				if p.callout != nil {
+					if !p.callout(callback) {
+						p.abort(errors.New("peripheral notification callback capacity exceeded"))
+						return
+					}
+				} else {
+					go callback()
+				}
 			}
 		}
 
