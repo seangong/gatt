@@ -122,7 +122,7 @@ func (a *Advertisement) unmarshall(b []byte) error {
 			a.LocalName = string(d)
 		case typeTxPower:
 			if len(d) > 0 {
-				a.TxPowerLevel = int(d[0])
+				a.TxPowerLevel = int(int8(d[0]))
 			}
 		case typeServiceSol16:
 			a.SolicitedService = uuidList(a.SolicitedService, d, 2)

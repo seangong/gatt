@@ -61,14 +61,14 @@ void XpcSendMessage(xpc_connection_t conn, xpc_object_t message, bool release, b
     }
 }
 
-void XpcArrayApply(void *v, xpc_object_t arr) {
+void XpcArrayApply(uintptr_t v, xpc_object_t arr) {
   xpc_array_apply(arr, ^bool(size_t index, xpc_object_t value) {
     arraySet(v, index, value);
     return true;
   });
 }
 
-void XpcDictApply(void *v, xpc_object_t dict) {
+void XpcDictApply(uintptr_t v, xpc_object_t dict) {
   xpc_dictionary_apply(dict, ^bool(const char *key, xpc_object_t value) {
     dictSet(v, (char *)key, value);
     return true;

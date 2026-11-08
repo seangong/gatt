@@ -19,7 +19,7 @@ func ExampleLnxSetAdvertisingEnable() {
 	d.Option(LnxSetAdvertisingEnable(true)) // Can only be used with Option.
 }
 
-func ExampleSetAdvertisingData() {
+func ExampleLnxSetAdvertisingData() {
 	// Manually crafting an advertising packet with a type field, and a service uuid - 0xFE01.
 	o := LnxSetAdvertisingData(&cmd.LESetAdvertisingData{
 		AdvertisingDataLength: 6,

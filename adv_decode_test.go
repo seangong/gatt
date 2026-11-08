@@ -84,8 +84,12 @@ func TestAdvertisementUnmarshallSkipsEmptyTxPower(t *testing.T) {
 		want int
 	}{
 		{[]byte{1, typeTxPower}, 0},
-		{[]byte{2, typeTxPower, 0xc5}, 197},
-		{[]byte{3, typeTxPower, 0xc5, 1}, 197},
+		{[]byte{2, typeTxPower, 0}, 0},
+		{[]byte{2, typeTxPower, 127}, 127},
+		{[]byte{2, typeTxPower, 0xff}, -1},
+		{[]byte{2, typeTxPower, 0x81}, -127},
+		{[]byte{2, typeTxPower, 0xc5}, -59},
+		{[]byte{3, typeTxPower, 0xc5, 1}, -59},
 	} {
 		data := append(append([]byte(nil), tt.data...), 2, typeCompleteName, 'n')
 		var a Advertisement

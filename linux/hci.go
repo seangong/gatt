@@ -572,10 +572,15 @@ func (h *HCI) cancelPendingConnection(ctx context.Context, a *connectionAttempt)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// The producer can still be publishing the terminal outcome after closing
+	// createDone. Read that outcome under the same lock before choosing Cancel.
+	h.connsmu.Lock()
 	select {
 	case <-a.done:
+		h.connsmu.Unlock()
 		return h.disconnectAttempt(ctx, a)
 	default:
+		h.connsmu.Unlock()
 	}
 
 	response, err := h.c.SendShutdownContext(ctx, cmd.LECreateConnCancel{})
@@ -935,7 +940,7 @@ func (h *HCI) handleLEMeta(b []byte) error {
 	// case evt.LELTKRequest:
 	// case evt.LERemoteConnectionParameterRequest:
 	default:
-		return fmt.Errorf("Unhandled LE event: %s, [ % X ]", code, b)
+		return fmt.Errorf("Unhandled LE event: 0x%02X, [ % X ]", code, b)
 	}
 	return nil
 }
@@ -1006,5 +1011,5 @@ func (h *HCI) handleL2CAP(b []byte) error {
 }
 
 func (h *HCI) trace(fmt string, v ...interface{}) {
-	log.Printf(fmt, v)
+	log.Printf(fmt, v...)
 }

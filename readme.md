@@ -149,6 +149,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -158,20 +160,26 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Print(err)
+		os.Exit(1)
+	}
+}
+
+func run() (err error) {
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
 	d, err := gatt.NewDevice(gatt.LnxDeviceID(0, true))
 	if err != nil {
-		log.Printf("open Bluetooth: %v", err)
-		return
+		return fmt.Errorf("open Bluetooth: %w", err)
 	}
 	stopper := d.(interface {
 		StopContext(context.Context) error
 	})
 	defer func() {
-		if err := stopper.StopContext(context.Background()); err != nil {
-			log.Printf("stop Bluetooth: %v", err)
+		if stopErr := stopper.StopContext(context.Background()); stopErr != nil {
+			err = errors.Join(err, fmt.Errorf("stop Bluetooth: %w", stopErr))
 		}
 	}()
 
@@ -190,21 +198,20 @@ func main() {
 		}
 		setup <- device.AdvertiseNameAndServices("Gopher", []gatt.UUID{service.UUID()})
 	}); err != nil {
-		log.Printf("initialize Bluetooth: %v", err)
-		return
+		return fmt.Errorf("initialize Bluetooth: %w", err)
 	}
 
 	select {
 	case err := <-setup:
 		if err != nil {
-			log.Printf("start advertising: %v", err)
-			return
+			return fmt.Errorf("start advertising: %w", err)
 		}
 	case <-ctx.Done():
-		return
+		return nil
 	}
 	log.Print("advertising Gopher; press Ctrl+C to stop")
 	<-ctx.Done()
+	return nil
 }
 ```
 
@@ -391,18 +398,19 @@ Build the packages on the intended platform:
 go build ./...
 ```
 
-On Linux, run tests with vet disabled while the existing HCI logging vet issues
-remain. Race testing also requires a supported architecture and a C toolchain:
+Run tests and static checks on the native platform. Race testing requires a
+supported architecture and a C toolchain:
 
 ```sh
-go test -vet=off ./...
-go test -race -vet=off ./...
+go test ./...
+go test -race ./...
+go vet ./...
 ```
 
-These commands do not establish a clean `go vet` result. On macOS, existing XPC
-tests also have compilation errors, so `go test ./...` is not currently a clean
-check. Keep controller/peer interoperability testing separate from unit tests;
-record the hardware, firmware, role and negotiated MTU.
+The macOS XPC conversion tests exercise synchronous value conversion without
+connecting to the Bluetooth service. They do not validate the legacy backend's
+connection or event lifecycle. Keep controller/peer interoperability testing
+separate from unit tests; record the hardware, firmware, role and negotiated MTU.
 
 ## Background and license
 
