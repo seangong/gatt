@@ -604,7 +604,7 @@ func (d *device) acceptPeripheral(pd *linux.PlatData, source Peripheral) {
 	p := &peripheral{
 		d: d, pd: pd, l2c: pd.Conn, mtu: attDefaultMTU,
 		reqc: make(chan message), quitc: make(chan struct{}),
-		sub: newSubscriber(), callout: d.startCallback,
+		sub: newSubscriber(), callbackSlots: d.callbackSlots,
 	}
 	if source == nil {
 		source = p

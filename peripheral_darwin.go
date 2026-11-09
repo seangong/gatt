@@ -462,7 +462,16 @@ func (p *peripheral) ReadRSSI() int {
 	if err != nil {
 		return -1
 	}
-	return rsp.MustGetInt("kCBMsgArgData")
+	if _, present := rsp["kCBMsgArgResult"]; present {
+		if err := darwinResult(rsp); err != nil {
+			return -1
+		}
+	}
+	value, ok := rsp["kCBMsgArgData"].(int64)
+	if !ok {
+		return -1
+	}
+	return int(value)
 }
 
 func (p *peripheral) SetMTU(mtu uint16) error {

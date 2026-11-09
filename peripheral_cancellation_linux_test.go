@@ -375,7 +375,8 @@ func TestPeripheralCallbackCapacityFailureClosesConnection(t *testing.T) {
 	c := newPeripheralTestConn()
 	p := newPeripheralForTest(c)
 	done := startPeripheralForTest(t, p, c)
-	p.callout = func(func()) bool { return false }
+	p.callbackSlots = make(chan struct{}, 1)
+	p.callbackSlots <- struct{}{}
 	p.sub.subscribe(3, func([]byte, error) { t.Error("rejected callback was called") })
 	c.reads <- peripheralTestRead{b: []byte{attOpHandleNotify, 3, 0, 'n'}}
 	select {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -35,6 +36,14 @@ type central struct {
 	notifiers     map[uint16]*notifier
 	notifiersmu   *sync.Mutex
 	indication    *pendingIndication // Protected by notifiersmu.
+	requestsMu    sync.Mutex
+	requests      map[*serverRequest]struct{}
+}
+
+type serverRequest struct {
+	data     []byte
+	deadline time.Time
+	timer    *time.Timer // Protected by central.requestsMu.
 }
 
 type pendingIndication struct {
@@ -42,6 +51,7 @@ type pendingIndication struct {
 }
 
 const indicationTimeout = 30 * time.Second
+const serverRequestTimeout = 30 * time.Second
 
 func newCentral(a *attrRange, addr net.HardwareAddr, l2conn io.ReadWriteCloser) *central {
 	if a == nil {
@@ -74,7 +84,18 @@ func (c *central) ID() string {
 }
 
 func (c *central) Close() error {
+	c.stop()
+	return c.l2conn.Close()
+}
+
+func (c *central) stop() {
 	c.cancel()
+	c.requestsMu.Lock()
+	for request := range c.requests {
+		request.timer.Stop()
+	}
+	clear(c.requests)
+	c.requestsMu.Unlock()
 	c.notifiersmu.Lock()
 	for _, n := range c.notifiers {
 		n.stop()
@@ -84,7 +105,78 @@ func (c *central) Close() error {
 		c.indication = nil
 	}
 	c.notifiersmu.Unlock()
-	return c.l2conn.Close()
+}
+
+// A request's deadline starts at reception, before it waits behind commands or
+// another handler. Unsupported commands and confirmations have no response wait.
+func (c *central) newRequest(data []byte) *serverRequest {
+	request := &serverRequest{data: data}
+	if len(data) == 0 || data[0]&0x40 != 0 || data[0] == attOpHandleCnf {
+		return request
+	}
+	request.deadline = time.Now().Add(serverRequestTimeout)
+	c.requestsMu.Lock()
+	defer c.requestsMu.Unlock()
+	if c.ctx.Err() != nil {
+		return request
+	}
+	if c.requests == nil {
+		c.requests = make(map[*serverRequest]struct{})
+	}
+	c.requests[request] = struct{}{}
+	request.timer = time.AfterFunc(time.Until(request.deadline), func() { c.expireRequest(request) })
+	return request
+}
+
+func (c *central) expireRequest(request *serverRequest) {
+	c.requestsMu.Lock()
+	_, pending := c.requests[request]
+	if pending && c.ctx.Err() == nil {
+		// Reject subsequent sends before transport cleanup can run.
+		c.cancel()
+	} else {
+		pending = false
+	}
+	c.requestsMu.Unlock()
+	if pending {
+		c.abortRequest(request)
+	}
+}
+
+func (c *central) abortRequest(request *serverRequest) {
+	c.stop()
+	err := fmt.Errorf("ATT request 0x%02x response timeout: %w", request.data[0], context.DeadlineExceeded)
+	if conn, ok := c.l2conn.(interface{ Abort(error) }); ok {
+		conn.Abort(err)
+		return
+	}
+	_ = c.l2conn.Close()
+}
+
+func (c *central) finishRequest(request *serverRequest) bool {
+	c.requestsMu.Lock()
+	_, pending := c.requests[request]
+	if pending {
+		delete(c.requests, request)
+		request.timer.Stop()
+	}
+	// A delayed timer must not let a handler or write finish beyond its deadline.
+	expired := pending && !time.Now().Before(request.deadline) && c.ctx.Err() == nil
+	if expired {
+		c.cancel()
+	}
+	c.requestsMu.Unlock()
+	if expired {
+		c.abortRequest(request)
+	}
+	return c.ctx.Err() == nil
+}
+
+func (c *central) requestActive(request *serverRequest) bool {
+	if !request.deadline.IsZero() && !time.Now().Before(request.deadline) {
+		c.expireRequest(request)
+	}
+	return c.ctx.Err() == nil
 }
 
 func (c *central) Context() context.Context { return c.ctx }
@@ -147,7 +239,7 @@ func (n *notifier) Cap() int {
 func (c *central) loop() {
 	// Keep confirmations flowing even while an application handler is blocked.
 	// The bounded queue also prevents commands from growing without limit.
-	requests := make(chan []byte, 16)
+	requests := make(chan *serverRequest, 16)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -160,7 +252,7 @@ func (c *central) loop() {
 				if c.ctx.Err() != nil {
 					return
 				}
-				if !c.handleAndRespond(request) {
+				if !c.respond(request) {
 					return
 				}
 			}
@@ -182,10 +274,11 @@ func (c *central) loop() {
 			c.handleReq(b[:n:n])
 			continue
 		}
+		request := c.newRequest(b[:n:n])
 		select {
 		case <-c.ctx.Done():
 			return
-		case requests <- b[:n:n]:
+		case requests <- request:
 		default:
 			return
 		}
@@ -211,6 +304,19 @@ func (c *central) unlockSend() { <-c.sendGate }
 // notifications. Ordinary handlers run outside the send gate: they may write
 // a notification themselves or wait for a confirmation.
 func (c *central) handleAndRespond(request []byte) bool {
+	return c.respond(c.newRequest(request))
+}
+
+func (c *central) respond(transaction *serverRequest) (ok bool) {
+	defer func() {
+		if !c.finishRequest(transaction) {
+			ok = false
+		}
+	}()
+	if !c.requestActive(transaction) {
+		return false
+	}
+	request := transaction.data
 	exchange := len(request) != 0 && request[0] == attOpMtuReq
 	if exchange {
 		if !c.lockSend() {
@@ -219,7 +325,7 @@ func (c *central) handleAndRespond(request []byte) bool {
 		defer c.unlockSend()
 	}
 	rsp := c.handleReq(request)
-	if c.ctx.Err() != nil {
+	if !c.requestActive(transaction) {
 		return false
 	}
 	if rsp == nil {
@@ -230,6 +336,9 @@ func (c *central) handleAndRespond(request []byte) bool {
 			return false
 		}
 		defer c.unlockSend()
+	}
+	if !c.requestActive(transaction) {
+		return false
 	}
 	if n, err := c.l2conn.Write(rsp); err != nil || n != len(rsp) {
 		return false

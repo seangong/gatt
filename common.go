@@ -83,7 +83,7 @@ func (p Property) String() (result string) {
 // A Service must not be copied after first use.
 type Service struct {
 	uuid    UUID
-	charsMu sync.RWMutex // Protects publication of chars.
+	charsMu sync.RWMutex // Protects chars publication and handles.
 	chars   []*Characteristic
 
 	h    uint16
@@ -121,16 +121,32 @@ func (s *Service) Name() string {
 }
 
 // Handle returns the Handle of the service.
-func (s *Service) Handle() uint16 { return s.h }
+func (s *Service) Handle() uint16 {
+	s.charsMu.RLock()
+	defer s.charsMu.RUnlock()
+	return s.h
+}
 
 // EndHandle returns the End Handle of the service.
-func (s *Service) EndHandle() uint16 { return s.endh }
+func (s *Service) EndHandle() uint16 {
+	s.charsMu.RLock()
+	defer s.charsMu.RUnlock()
+	return s.endh
+}
 
 // SetHandle sets the Handle of the service.
-func (s *Service) SetHandle(h uint16) { s.h = h }
+func (s *Service) SetHandle(h uint16) {
+	s.charsMu.Lock()
+	s.h = h
+	s.charsMu.Unlock()
+}
 
 // SetEndHandle sets the End Handle of the service.
-func (s *Service) SetEndHandle(endh uint16) { s.endh = endh }
+func (s *Service) SetEndHandle(endh uint16) {
+	s.charsMu.Lock()
+	s.endh = endh
+	s.charsMu.Unlock()
+}
 
 // SetCharacteristics sets the Characteristics of the service.
 func (s *Service) SetCharacteristics(chars []*Characteristic) {
@@ -154,7 +170,7 @@ type Characteristic struct {
 	secure Property // security enabled properties
 	svc    *Service
 
-	descsMu sync.RWMutex // Protects publication of descs and cccd.
+	descsMu sync.RWMutex // Protects descs/cccd publication and handles.
 	cccd    *Descriptor
 	descs   []*Descriptor
 
@@ -184,13 +200,25 @@ func NewCharacteristic(u UUID, s *Service, props Property, h uint16, vh uint16) 
 }
 
 // Handle returns the Handle of the characteristic.
-func (c *Characteristic) Handle() uint16 { return c.h }
+func (c *Characteristic) Handle() uint16 {
+	c.descsMu.RLock()
+	defer c.descsMu.RUnlock()
+	return c.h
+}
 
 // VHandle returns the Value Handle of the characteristic.
-func (c *Characteristic) VHandle() uint16 { return c.vh }
+func (c *Characteristic) VHandle() uint16 {
+	c.descsMu.RLock()
+	defer c.descsMu.RUnlock()
+	return c.vh
+}
 
 // EndHandle returns the End Handle of the characteristic.
-func (c *Characteristic) EndHandle() uint16 { return c.endh }
+func (c *Characteristic) EndHandle() uint16 {
+	c.descsMu.RLock()
+	defer c.descsMu.RUnlock()
+	return c.endh
+}
 
 // Descriptor returns the Descriptor of the characteristic.
 func (c *Characteristic) Descriptor() *Descriptor {
@@ -200,13 +228,25 @@ func (c *Characteristic) Descriptor() *Descriptor {
 }
 
 // SetHandle sets the Handle of the characteristic.
-func (c *Characteristic) SetHandle(h uint16) { c.h = h }
+func (c *Characteristic) SetHandle(h uint16) {
+	c.descsMu.Lock()
+	c.h = h
+	c.descsMu.Unlock()
+}
 
 // SetVHandle sets the Value Handle of the characteristic.
-func (c *Characteristic) SetVHandle(vh uint16) { c.vh = vh }
+func (c *Characteristic) SetVHandle(vh uint16) {
+	c.descsMu.Lock()
+	c.vh = vh
+	c.descsMu.Unlock()
+}
 
 // SetEndHandle sets the End Handle of the characteristic.
-func (c *Characteristic) SetEndHandle(endh uint16) { c.endh = endh }
+func (c *Characteristic) SetEndHandle(endh uint16) {
+	c.descsMu.Lock()
+	c.endh = endh
+	c.descsMu.Unlock()
+}
 
 // SetDescriptor sets the Descriptor of the characteristic.
 func (c *Characteristic) SetDescriptor(cccd *Descriptor) {
@@ -369,11 +409,23 @@ type Descriptor struct {
 	whandler WriteHandler
 }
 
+// A shared short-lived lock preserves Descriptor value-copy behavior without
+// embedding a mutex in each descriptor. It never protects IO or callbacks.
+var descriptorHandleMu sync.RWMutex
+
 // Handle returns the Handle of the descriptor.
-func (d *Descriptor) Handle() uint16 { return d.h }
+func (d *Descriptor) Handle() uint16 {
+	descriptorHandleMu.RLock()
+	defer descriptorHandleMu.RUnlock()
+	return d.h
+}
 
 // SetHandle sets the Handle of the descriptor.
-func (d *Descriptor) SetHandle(h uint16) { d.h = h }
+func (d *Descriptor) SetHandle(h uint16) {
+	descriptorHandleMu.Lock()
+	d.h = h
+	descriptorHandleMu.Unlock()
+}
 
 // NewDescriptor creates and returns a Descriptor.
 func NewDescriptor(u UUID, h uint16, char *Characteristic) *Descriptor {

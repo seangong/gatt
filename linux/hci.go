@@ -852,6 +852,13 @@ func (h *HCI) handlePacket(b []byte) {
 		if err != nil && len(b) != 0 {
 			if b[0] == evt.HardwareError {
 				h.requestClose(fmt.Errorf("hci: invalid hardware-error event: %w", err))
+			} else if b[0] == evt.CommandComplete || b[0] == evt.CommandStatus {
+				// Once a command response cannot be parsed, its transaction and
+				// command allowance cannot safely be recovered. A closed Cmd can
+				// also reject a valid response during normal transport shutdown.
+				if !errors.Is(err, io.ErrClosedPipe) {
+					h.requestClose(fmt.Errorf("hci: invalid command event 0x%02x: %w", b[0], err))
+				}
 			} else if b[0] == evt.NumberOfCompletedPkts || b[0] == evt.DisconnectionComplete ||
 				b[0] == evt.LEMeta && len(b) > 2 && b[2] == byte(evt.LEConnectionComplete) {
 				h.requestClose(err)

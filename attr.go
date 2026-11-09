@@ -129,7 +129,7 @@ func generateAttributes(ss []*Service, base uint16) *attrRange {
 }
 
 func generateServiceAttributes(s *Service, h uint16, last bool) (uint16, []attr) {
-	s.h = h
+	s.SetHandle(h)
 	// endh set later
 	a := attr{
 		h:     h,
@@ -147,20 +147,22 @@ func generateServiceAttributes(s *Service, h uint16, last bool) (uint16, []attr)
 		aa = append(aa, a...)
 	}
 
-	s.endh = h - 1
+	endHandle := h - 1
 	if last {
 		h = 0xFFFF
-		s.endh = h
+		endHandle = h
 	}
-	aa[0].groupEnd = s.endh
+	s.SetEndHandle(endHandle)
+	aa[0].groupEnd = endHandle
 
 	return h, aa
 }
 
 func generateCharAttributes(c *Characteristic, h uint16) (uint16, []attr) {
 	valueHandle := h + 1
-	c.h = h
-	c.vh = valueHandle
+	c.descsMu.Lock()
+	c.h, c.vh = h, valueHandle
+	c.descsMu.Unlock()
 	ca := attr{
 		h:     h,
 		typ:   attrCharacteristicUUID,
@@ -195,7 +197,7 @@ func generateCharAttributes(c *Characteristic, h uint16) (uint16, []attr) {
 }
 
 func generateDescAttributes(d *Descriptor, h uint16) attr {
-	d.h = h
+	d.SetHandle(h)
 	a := attr{
 		h:        h,
 		typ:      d.uuid,

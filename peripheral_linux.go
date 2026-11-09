@@ -39,15 +39,17 @@ type peripheral struct {
 	mtu uint16 // Owned by requestLoop after the connection starts.
 	l2c io.ReadWriteCloser
 
-	reqc         chan message
-	quitc        chan struct{}
-	stopOnce     sync.Once
-	abortOnce    sync.Once
-	stopErr      error // Published by closing quitc.
-	callout      func(func()) bool
-	metadataOnce sync.Once
-	metadataGate chan struct{}
-	responseMu   sync.Mutex
+	reqc             chan message
+	quitc            chan struct{}
+	stopOnce         sync.Once
+	abortOnce        sync.Once
+	stopErr          error // Published by closing quitc.
+	callbackSlots    chan struct{}
+	notificationOnce sync.Once
+	notifications    *peripheralNotifications
+	metadataOnce     sync.Once
+	metadataGate     chan struct{}
+	responseMu       sync.Mutex
 	// responsePending is registered before Write and cleared before its reader
 	// acknowledgement. Only the request owner changes it, under responseMu.
 	responsePending bool
@@ -532,6 +534,7 @@ func (p *peripheral) stop(err error) {
 	p.stopOnce.Do(func() {
 		p.stopErr = err
 		close(p.quitc)
+		p.notificationQueue().stop()
 	})
 }
 
@@ -834,13 +837,9 @@ func (p *peripheral) readLoop(rspc chan<- []byte, processed <-chan uint16, recei
 				log.Printf("notified by unsubscribed handle")
 			} else {
 				callback := func() { f(b[3:], nil) }
-				if p.callout != nil {
-					if !p.callout(callback) {
-						p.abort(errors.New("peripheral notification callback capacity exceeded"))
-						return
-					}
-				} else {
-					go callback()
+				if !p.notificationQueue().enqueue(p, callback) {
+					p.abort(errPeripheralNotificationCapacity)
+					return
 				}
 			}
 		}

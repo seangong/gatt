@@ -224,10 +224,11 @@ type CommandStatusEP struct {
 }
 
 func (e *CommandStatusEP) Unmarshal(b []byte) error {
-	buf := bytes.NewBuffer(b)
-	binary.Read(buf, binary.LittleEndian, &e.Status)
-	binary.Read(buf, binary.LittleEndian, &e.NumHCICommandPackets)
-	return binary.Read(buf, binary.LittleEndian, &e.CommandOpcode)
+	if len(b) != 4 {
+		return errors.New("invalid command-status event length")
+	}
+	*e = CommandStatusEP{Status: b[0], NumHCICommandPackets: b[1], CommandOpcode: o.Uint16(b[2:4])}
+	return nil
 }
 
 type NumOfCompletedPkt struct {

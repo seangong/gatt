@@ -217,6 +217,16 @@ for its disconnection callback before reconnecting to the same device; other
 connections remain usable.
 Failed subscription changes preserve the previous callback.
 
+On Linux, notification callbacks run in wire order for each connection, outside
+the ATT response and indication-confirmation paths. Connected can subscribe and
+wait for a notification; a notification callback can make synchronous requests,
+cancel the connection or stop the device. Queued and running callbacks share the
+existing device callback allowance (`max(1, maxConn) * 16`); there is no additional
+per-connection limit. Exhaustion terminates the receiving connection. Termination
+discards callbacks that have not started and releases their allowance; a running
+callback retains its allowance until it returns and may finish after Disconnected
+or Stop. Different connections have independent notification queues.
+
 On macOS, Connected and Disconnected callbacks run in order for each connected
 owner. Notifications use a separate FIFO, so Connected can subscribe and wait
 for a notification, and a notification callback can cancel and wait for
@@ -234,6 +244,10 @@ remains occupied until its handlers actually return; exhaustion terminates the
 device session and is observable through Done/Err. These are library resource
 bounds, not controller capacity limits; they do not cover scan, state or server
 notification handlers. Close does not wait for application handlers.
+
+macOS `ReadRSSI` returns `-1` on transport or native operation failure, or when
+the response has no integer RSSI value. Successful legacy responses without an
+explicit result field remain supported.
 
 Repeated macOS `Connect` calls for the same UUID still send the native connection
 command, but preserve the current pending or connected session and its requests,
@@ -439,6 +453,9 @@ connections retain their handles, handlers and subscriptions until disconnected.
 Public service objects report the newest registered handles. An empty service
 table returns normal ATT errors rather than ending the connection. Configure
 objects before registration and synchronize application-owned mutable state.
+Public handle getters can run concurrently with Linux registration. Separate
+getter calls do not form an atomic snapshot of one registration; serialize
+registration with those reads when a consistent set of handles is required.
 
 The default ATT MTU is 23. Linux accepts MTUs up to 517, while a single
 notification or indication value is limited to `min(MTU - 3, 512)` bytes.
@@ -476,6 +493,13 @@ an uncertain indication write failure closes the connection.
 Handlers should observe `Request.Context()` when doing blocking work.
 Notification handlers should also check `Notifier.Done()` when unsubscribed.
 A transport write already in progress may finish after `Done()` becomes true.
+
+Linux server requests have a 30-second response deadline starting when the ATT
+receiver reads the PDU, including queueing, handler execution and response writes.
+Expiry cancels the connection context, stops notifiers and retires that bearer;
+late handler results are discarded. A handler that ignores cancellation retains
+its resource slot until it actually returns. Write Commands and confirmations
+do not start a response deadline. Completed requests cancel their own timer.
 
 On macOS, server read and write handlers run in one bounded FIFO outside the
 native XPC receiver, so they can call synchronous device methods. When the
@@ -551,6 +575,11 @@ command allowance. Sending waits while that allowance is zero. Shutdown rejects
 unsent ordinary commands while keeping cleanup commands admissible; cleanup
 still needs controller allowance and uses the shared shutdown deadline. If the
 controller never grants it, shutdown follows the existing forced-close path.
+Malformed Command Status or Command Complete events terminate the HCI session
+and release pending work, preserving the parsing failure as the shutdown cause.
+Command Status requires its fixed four-byte payload; Command Complete retains
+its variable-length return parameters. Valid responses rejected by an already
+closed command processor do not create a new shutdown fault.
 
 Library-generated Disconnect commands retain their connection identity while
 waiting for the command slot, controller allowance or socket writability. A
