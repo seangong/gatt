@@ -40,7 +40,7 @@ Current limitations include:
 - **Linux client APIs:** `DiscoverIncludedServices` is unimplemented and returns
   `nil, nil`; `ReadRSSI` returns `-1`. Scan and discovery UUID filters are not
   implemented, so filter returned results in your application.
-- **Controller capacity:** Linux transmit-buffer size and packet-count settings
+- **Controller capacity:** Linux ACL transmit-buffer size and packet-count settings
   are fixed in the implementation rather than fully negotiated from capacity.
 - **macOS APIs:** `DiscoverIncludedServices` and `SetMTU` are unimplemented;
   `SetIndicateValue` is a placeholder that returns `nil` without subscribing.
@@ -95,6 +95,12 @@ error. Already applied options are not rolled back. `NewDevice` returns an
 option error before opening the HCI or XPC connection; wrapped errors remain
 identifiable with `errors.Is` and `errors.As`.
 
+On Linux, `LnxSendHCIRawCommand` and `LnxSetAdvertisingEnable` require a device
+returned by `NewDevice`; use them with `Device.Option`. Passing these runtime
+options to `NewDevice` returns an error before opening the controller. Raw
+command options also return response-writer errors; a short write matches
+`io.ErrShortWrite`. A response-writer failure does not undo the HCI command.
+
 ## Linux setup
 
 Use a kernel with HCI user-channel support, introduced in Linux 3.14, and a
@@ -105,6 +111,11 @@ The package normally binds `HCI_CHANNEL_USER` and takes exclusive control of the
 selected adapter. It cannot share that adapter with BlueZ or another owner.
 The implementation has a raw-channel fallback for older kernels; that does not
 guarantee compatibility with those systems.
+
+Initialization reads the controller's standard feature report after reset.
+LE-only controllers skip the legacy BR/EDR configuration; dual-mode controllers
+retain it. Required LE command failures still stop initialization. This does
+not add controller-capacity negotiation or pairing support.
 
 Inspect the adapters and select the one your application will own:
 
@@ -198,6 +209,11 @@ returns `ErrDatabaseChanged` and cancels only that peripheral connection. Wait
 for its disconnection callback before reconnecting to the same device; other
 connections remain usable.
 Failed subscription changes preserve the previous callback.
+
+Repeated macOS `Connect` calls for the same UUID still send the native connection
+command, but preserve the current pending or connected session and its requests,
+cache and subscriptions. Duplicate success events do not publish another session
+or success callback. A pending attempt keeps its first request identity.
 
 On macOS, `RemoveAllServices` releases the local attribute registrations and
 stops their notifiers after the removal command is queued locally. Old notifiers
@@ -294,6 +310,19 @@ scan-response packets each have a 31-byte budget, including field headers.
 Advertise a discovery UUID that fits; clients can discover the remaining
 services after connecting.
 
+`AppendUUIDFit` combines service UUIDs of the same width into one list. It
+preserves input priority and includes only whole UUIDs. A `false` result means
+some requested UUIDs were omitted; capacity exhaustion does not set `Err()`.
+Completeness is reported separately for each UUID width. Repeated calls merge
+with existing lists, and an incomplete list stays incomplete.
+
+On Linux, automatic advertising recovery follows the last explicit enable or
+stop request. Connections do not enable advertising for a client that has never
+requested it, and a completed stop is not undone by a queued recovery task.
+`AdvertiseNameAndServices` clears the previous scan response when its new name
+fits in the advertising packet. Raw `Advertise` and custom scan-response options
+retain their existing behavior.
+
 `AdvPacket` append methods retain their existing payload-truncation behavior.
 If even a field's two-byte header cannot fit, the packet keeps its previous
 contents and `Err()` reports `ErrEIRPacketTooLong`. `Advertise` returns that
@@ -323,6 +352,16 @@ Read and write handlers use API statuses, not raw ATT error codes:
 Write-without-response commands never receive an ATT response, including when a
 handler rejects the write. Use an application-level acknowledgement when the
 sender needs to know the business result.
+Unsupported commands, including Signed Write, are discarded without a response.
+Linux routes only L2CAP CID 4 into ATT; unsupported channels do not become ATT
+responses. This does not add pairing or SMP support.
+
+Linux connections keep the attribute registration accepted when they connected.
+`AddService`, `SetServices` and `RemoveAllServices` affect new connections; existing
+connections retain their handles, handlers and subscriptions until disconnected.
+Public service objects report the newest registered handles. An empty service
+table returns normal ATT errors rather than ending the connection. Configure
+objects before registration and synchronize application-owned mutable state.
 
 The default ATT MTU is 23. Linux accepts MTUs up to 517, while a single
 notification or indication value is limited to `min(MTU - 3, 512)` bytes.
@@ -355,6 +394,12 @@ Handlers should observe `Request.Context()` when doing blocking work.
 Notification handlers should also check `Notifier.Done()` when unsubscribed.
 A transport write already in progress may finish after `Done()` becomes true.
 
+On macOS, server read and write handlers run in one bounded FIFO outside the
+native XPC receiver, so they can call synchronous device methods. When the
+queue is full, requests requiring a response return Insufficient Resources
+without invoking a business handler. Close cancels queued work without waiting
+for a handler that ignores cancellation.
+
 Linux client discovery publishes its cache only after a complete successful
 discovery. Repeating discovery with the same attribute layout reuses the
 existing objects, CCCD and subscriptions. A failed or incomplete discovery
@@ -383,6 +428,8 @@ is closed and queued operations are released. Establish a new connection before
 retrying, and do not automatically replay business writes. Queueing, controller
 credit waits and local transport writes precede this response timer, so it is
 not a total API-call deadline. Writes without response have no response timer.
+Responses received while no ATT request is awaiting a response are discarded
+without blocking notifications or carrying a result into a future request.
 
 ## Linux shutdown and reopening
 
@@ -390,6 +437,12 @@ Linux devices expose optional `StopContext(context.Context) error` and
 `Stop() error` methods. They are not part of the portable `Device` interface;
 use a capability assertion as in the example above. Other platforms do not
 provide the same shutdown contract.
+
+Linux HCI commands remain serialized and also respect the controller's reported
+command allowance. Sending waits while that allowance is zero. Shutdown rejects
+unsent ordinary commands while keeping cleanup commands admissible; cleanup
+still needs controller allowance and uses the shared shutdown deadline. If the
+controller never grants it, shutdown follows the existing forced-close path.
 
 - `StopContext` rejects new operations, cancels connection IO and starts one
   shared shutdown. Concurrent callers wait for the same cleanup and result.
@@ -414,12 +467,19 @@ provide the same shutdown contract.
 `Device` interface. Returning from a call is not a connection-success signal;
 observe completion callbacks and use application-level timeouts where needed.
 
+On Linux, `Central.ID()` reports the peer's MAC address in its normal displayed
+byte order. Older revisions reversed that address; applications that persisted
+those reversed IDs must correct their mappings. The same central object is
+used for connected, request and disconnected callbacks.
+
 For Linux outgoing connections, command rejection, connection failure and setup
 failure are reported through `PeripheralConnected` with the original request
 object and a non-nil error. That object does not represent a usable connection.
 Explicit cancellation and normal shutdown suppress pending connection callbacks.
 Low-level HCI callers can use `ConnectWithResult` to receive one buffered result;
 the existing HCI `Connect` return value and success handler remain unchanged.
+Successful outgoing connections retain the name known when the attempt began
+if later scan reports have no name. Continuing a scan does not erase that name.
 
 ## Repository examples
 

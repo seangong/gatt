@@ -20,6 +20,7 @@ func completedACL(handle uint16, count byte) []byte {
 func TestACLDisconnectReturnsOnlyConnectionCredits(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newShutdownTestHCI(t, false)
+		h.adv = true // Exercise credit accounting while advertising resumes.
 		first, second := newConn(h, 1), newConn(h, 2)
 		h.conns[1], h.conns[2] = first, second
 		for i := 0; i < cap(h.bufCnt); i++ {
@@ -164,6 +165,7 @@ func newSubmissionTestHCI(t *testing.T, poll bool) (*HCI, *submissionTestTranspo
 func TestACLRetiredPollRetryCannotWriteToReusedHandle(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newSubmissionTestHCI(t, true)
+		h.adv = true
 		old := newConn(h, 1)
 		h.conns[1] = old
 		result := make(chan error, 1)
@@ -205,6 +207,7 @@ func TestACLRetiredPollRetryCannotWriteToReusedHandle(t *testing.T) {
 func TestACLCompletionBeforeOuterWriteReturn(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newSubmissionTestHCI(t, false)
+		h.adv = true
 		c := newConn(h, 1)
 		h.conns[1] = c
 		result := make(chan error, 1)

@@ -106,6 +106,7 @@ func TestConnCloseFailureShutsDownHCI(t *testing.T) {
 func TestConnCloseCompletionKeepsHCIAvailable(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newShutdownTestHCI(t, false)
+		h.adv = true
 		c := newConn(h, 1)
 		h.connsmu.Lock()
 		h.conns[c.attr] = c

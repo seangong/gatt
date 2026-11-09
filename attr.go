@@ -12,6 +12,15 @@ type attr struct {
 	secure   Property // attribute secure (implementation specific usage)
 	value    []byte   // attribute value
 
+	// Linux connections retain these registration values when the public
+	// service objects are reused to build a newer attribute table.
+	groupEnd    uint16
+	valueHandle uint16
+	notifyProps Property
+	rhandler    ReadHandler
+	whandler    WriteHandler
+	nhandler    NotifyHandler
+
 	pvt interface{} // point to the corresponsing Serveice/Characteristic/Descriptor
 }
 
@@ -116,32 +125,42 @@ func generateServiceAttributes(s *Service, h uint16, last bool) (uint16, []attr)
 		h = 0xFFFF
 		s.endh = h
 	}
+	aa[0].groupEnd = s.endh
 
 	return h, aa
 }
 
 func generateCharAttributes(c *Characteristic, h uint16) (uint16, []attr) {
+	valueHandle := h + 1
 	c.h = h
-	c.vh = h + 1
+	c.vh = valueHandle
 	ca := attr{
-		h:     c.h,
+		h:     h,
 		typ:   attrCharacteristicUUID,
-		value: append([]byte{byte(c.props), byte(c.vh), byte((c.vh) >> 8)}, c.uuid.b...),
+		value: append([]byte{byte(c.props), byte(valueHandle), byte(valueHandle >> 8)}, c.uuid.b...),
 		props: CharRead,
 		pvt:   c,
 	}
 	va := attr{
-		h:     c.vh,
-		typ:   c.uuid,
-		value: c.value,
-		props: c.props,
-		pvt:   c,
+		h:        valueHandle,
+		typ:      c.uuid,
+		value:    c.value,
+		props:    c.props,
+		rhandler: c.rhandler,
+		whandler: c.whandler,
+		pvt:      c,
 	}
 	h += 2
 
 	aa := []attr{ca, va}
 	for _, d := range c.descs {
-		aa = append(aa, generateDescAttributes(d, h))
+		a := generateDescAttributes(d, h)
+		if d.uuid.Equal(attrClientCharacteristicConfigUUID) {
+			a.valueHandle = valueHandle
+			a.notifyProps = c.props & (CharNotify | CharIndicate)
+			a.nhandler = c.nhandler
+		}
+		aa = append(aa, a)
 		h++
 	}
 
@@ -151,11 +170,13 @@ func generateCharAttributes(c *Characteristic, h uint16) (uint16, []attr) {
 func generateDescAttributes(d *Descriptor, h uint16) attr {
 	d.h = h
 	a := attr{
-		h:     h,
-		typ:   d.uuid,
-		value: d.value,
-		props: d.props,
-		pvt:   d,
+		h:        h,
+		typ:      d.uuid,
+		value:    d.value,
+		props:    d.props,
+		rhandler: d.rhandler,
+		whandler: d.whandler,
+		pvt:      d,
 	}
 	return a
 }

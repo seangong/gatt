@@ -21,14 +21,16 @@ type CmdParam interface {
 
 func NewCmd(d io.Writer) *Cmd {
 	c := &Cmd{
-		dev:        d,
-		sent:       []*cmdPkt{},
-		sendGate:   make(chan struct{}, 1),
-		compc:      make(chan evt.CommandCompleteEP),
-		statusc:    make(chan evt.CommandStatusEP),
-		shutdown:   make(chan struct{}),
-		done:       make(chan struct{}),
-		workerDone: make(chan struct{}),
+		dev:           d,
+		sent:          []*cmdPkt{},
+		sendGate:      make(chan struct{}, 1),
+		credits:       1,
+		creditChanged: make(chan struct{}, 1),
+		compc:         make(chan evt.CommandCompleteEP),
+		statusc:       make(chan evt.CommandStatusEP),
+		shutdown:      make(chan struct{}),
+		done:          make(chan struct{}),
+		workerDone:    make(chan struct{}),
 	}
 	go c.processCmdEvents()
 	return c
@@ -56,17 +58,20 @@ func (c cmdPkt) Marshal() []byte {
 }
 
 type Cmd struct {
-	sendGate     chan struct{} // Serialize complete command transactions.
-	sentMu       sync.Mutex    // Protect sent from the event worker and Send cleanup.
-	dev          io.Writer
-	sent         []*cmdPkt
-	compc        chan evt.CommandCompleteEP
-	statusc      chan evt.CommandStatusEP
-	shutdown     chan struct{}
-	shutdownOnce sync.Once
-	done         chan struct{}
-	workerDone   chan struct{}
-	closeOnce    sync.Once
+	sendGate      chan struct{} // Serialize complete command transactions.
+	sentMu        sync.Mutex    // Protect sent, credits and creditEpoch.
+	dev           io.Writer
+	sent          []*cmdPkt
+	credits       uint8
+	creditEpoch   uint64
+	creditChanged chan struct{}
+	compc         chan evt.CommandCompleteEP
+	statusc       chan evt.CommandStatusEP
+	shutdown      chan struct{}
+	shutdownOnce  sync.Once
+	done          chan struct{}
+	workerDone    chan struct{}
+	closeOnce     sync.Once
 }
 
 func (c *Cmd) trace(fmt string, v ...interface{}) {}
@@ -128,8 +133,8 @@ func (c *Cmd) Send(cp CmdParam) ([]byte, error) {
 	return c.SendContext(context.Background(), cp)
 }
 
-// SendContext waits for the serial command slot and controller response until
-// ctx is canceled or the command processor is closed. Canceling after a command
+// SendContext waits for the serial command slot, controller credit and response
+// until ctx is canceled or the command processor is closed. Canceling after a command
 // is written closes the processor: a late response must not match a later
 // command with the same opcode. It cannot interrupt the device's Write.
 func (c *Cmd) SendContext(ctx context.Context, cp CmdParam) ([]byte, error) {
@@ -172,6 +177,16 @@ func (c *Cmd) sendContext(ctx context.Context, cp CmdParam, shutdown bool) ([]by
 	op := cp.Opcode()
 	p := &cmdPkt{op: op, cp: cp, done: make(chan cmdResult, 1)}
 	raw := p.Marshal()
+	epoch, err := c.takeCredit(ctx, stopping)
+	if err != nil {
+		return nil, err
+	}
+	refund := true
+	defer func() {
+		if refund {
+			c.refundCredit(epoch)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -196,9 +211,16 @@ func (c *Cmd) sendContext(ctx context.Context, cp CmdParam, shutdown bool) ([]by
 			}
 		}
 	}()
-	if n, err := c.dev.Write(raw); err != nil {
+	n, err := c.dev.Write(raw)
+	if n == len(raw) {
+		// A Writer may report a complete packet together with an error. That
+		// packet has consumed its credit even though the caller gets the error.
+		refund = false
+	}
+	if err != nil {
 		return nil, err
-	} else if n != len(raw) {
+	}
+	if n != len(raw) {
 		return nil, errors.New("Failed to send whole Cmd pkt to HCI socket")
 	}
 	select {
@@ -212,6 +234,59 @@ func (c *Cmd) sendContext(ctx context.Context, cp CmdParam, shutdown bool) ([]by
 		return nil, io.ErrClosedPipe
 	case result := <-p.done:
 		return result.response, result.err
+	}
+}
+
+func (c *Cmd) takeCredit(ctx context.Context, stopping <-chan struct{}) (uint64, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		select {
+		case <-c.done:
+			return 0, io.ErrClosedPipe
+		case <-stopping:
+			return 0, io.ErrClosedPipe
+		default:
+		}
+		c.sentMu.Lock()
+		if c.credits != 0 {
+			c.credits--
+			epoch := c.creditEpoch
+			c.sentMu.Unlock()
+			return epoch, nil
+		}
+		c.sentMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-c.done:
+			return 0, io.ErrClosedPipe
+		case <-stopping:
+			return 0, io.ErrClosedPipe
+		case <-c.creditChanged:
+		}
+	}
+}
+
+func (c *Cmd) refundCredit(epoch uint64) {
+	c.sentMu.Lock()
+	defer c.sentMu.Unlock()
+	// A controller event replaces the entire allowance, including any newer
+	// grant received while Write was running. Do not add a stale reservation.
+	if c.creditEpoch == epoch {
+		c.credits++
+	}
+}
+
+// updateCredits requires sentMu so the event's response cannot match a new
+// transaction admitted by the same credit update.
+func (c *Cmd) updateCredits(credits uint8) {
+	c.credits = credits
+	c.creditEpoch++
+	select {
+	case c.creditChanged <- struct{}{}:
+	default:
 	}
 }
 
@@ -249,6 +324,11 @@ func (c *Cmd) processCmdEvents() {
 		case status := <-c.statusc:
 			var pending *cmdPkt
 			c.sentMu.Lock()
+			c.updateCredits(status.NumHCICommandPackets)
+			if status.CommandOpcode == 0 {
+				c.sentMu.Unlock()
+				continue
+			}
 			for i, p := range c.sent {
 				if uint16(p.op) == status.CommandOpcode {
 					pending = p
@@ -269,6 +349,11 @@ func (c *Cmd) processCmdEvents() {
 		case comp := <-c.compc:
 			var pending *cmdPkt
 			c.sentMu.Lock()
+			c.updateCredits(comp.NumHCICommandPackets)
+			if comp.CommandOPCode == 0 {
+				c.sentMu.Unlock()
+				continue
+			}
 			for i, p := range c.sent {
 				if uint16(p.op) == comp.CommandOPCode {
 					pending = p
@@ -679,7 +764,7 @@ type LESetEventMaskRP struct{ Status uint8 }
 type LEReadBufferSize struct{}
 
 func (c LEReadBufferSize) Opcode() int      { return opLEReadBufferSize }
-func (c LEReadBufferSize) Len() int         { return 1 }
+func (c LEReadBufferSize) Len() int         { return 0 }
 func (c LEReadBufferSize) Marshal(b []byte) {}
 
 type LEReadBufferSizeRP struct {
@@ -966,7 +1051,7 @@ type LEReadChannelMapRP struct {
 type LEReadRemoteUsedFeatures struct{ ConnectionHandle uint16 }
 
 func (c LEReadRemoteUsedFeatures) Opcode() int      { return opLEReadRemoteUsedFeatures }
-func (c LEReadRemoteUsedFeatures) Len() int         { return 8 }
+func (c LEReadRemoteUsedFeatures) Len() int         { return 2 }
 func (c LEReadRemoteUsedFeatures) Marshal(b []byte) { o.PutUint16(b, c.ConnectionHandle) }
 
 type LEReadRemoteUsedFeaturesRP struct{}

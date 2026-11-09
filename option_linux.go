@@ -2,6 +2,7 @@ package gatt
 
 import (
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/seangong/gatt/v2/linux/cmd"
@@ -36,7 +37,7 @@ func LnxMaxConnections(n int) Option {
 func LnxSetAdvertisingEnable(en bool) Option {
 	return func(d Device) error {
 		dd := d.(*device)
-		if dd == nil {
+		if dd == nil || dd.hci == nil {
 			return errors.New("device is not initialized")
 		}
 		if err := dd.update(); err != nil {
@@ -74,14 +75,25 @@ func LnxSetAdvertisingParameters(c *cmd.LESetAdvertisingParameters) Option {
 }
 
 // LnxSendHCIRawCommand sends a raw command to the HCI device
-// This option can be used with NewDevice or Option on Linux implementation.
+// This option can only be used with Option after NewDevice succeeds on Linux.
+// NewDevice rejects it before opening the controller.
 func LnxSendHCIRawCommand(c cmd.CmdParam, rsp io.Writer) Option {
 	return func(d Device) error {
 		b, err := d.(*device).SendHCIRawCommand(c)
-		if rsp == nil {
-			return err
-		}
-		rsp.Write(b)
-		return err
+		return writeHCIRawResponse(rsp, b, err)
 	}
+}
+
+func writeHCIRawResponse(rsp io.Writer, b []byte, commandErr error) error {
+	if rsp == nil {
+		return commandErr
+	}
+	n, err := rsp.Write(b)
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return errors.Join(commandErr, fmt.Errorf("write HCI response: %w", err))
+	}
+	return commandErr
 }

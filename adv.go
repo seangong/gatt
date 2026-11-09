@@ -212,40 +212,130 @@ func (a *AdvPacket) AppendManufacturerData(id uint16, b []byte) *AdvPacket {
 	return a.AppendField(typeManufacturerData, d)
 }
 
-// AppendUUIDFit appends a BLE advertised service UUID
-// packet field if it fits in the packet, and reports whether the UUID fit.
+// AppendUUIDFit groups advertised service UUIDs by width, prioritizing them in
+// input order until one does not fit. GAP and GATT UUIDs are omitted. Existing
+// incomplete lists remain incomplete. Zero and unsupported-width UUIDs are not
+// encoded and cause a false result. Malformed existing fields leave the packet
+// unchanged. This method does not set Err when UUIDs cannot be appended.
 func (a *AdvPacket) AppendUUIDFit(uu []UUID) bool {
-	// Iterate all UUIDs to see if they fit in the packet or not.
-	fit, l := true, len(a.b)
+	fit, hasUUID := true, false
 	for _, u := range uu {
 		if u.Equal(attrGAPUUID) || u.Equal(attrGATTUUID) {
 			continue
 		}
-		l += 2 + u.Len()
-		if l > MaxEIRPacketLength {
+		switch u.Len() {
+		case 2, 16:
+			hasUUID = true
+		default:
 			fit = false
-			break
 		}
+	}
+	if !hasUUID {
+		return fit
+	}
+	if a.err != nil {
+		return false
 	}
 
-	// Append the UUIDs until they no longer fit.
+	type uuidList struct {
+		width    int
+		present  bool
+		complete bool
+		data     []byte
+	}
+	type field struct {
+		raw  []byte
+		list *uuidList
+	}
+	small := uuidList{width: 2, complete: true}
+	large := uuidList{width: 16, complete: true}
+	var fields []field
+	size := 0
+	// Keep the first list's position and the order of unrelated fields. Raw
+	// AppendField calls may have supplied more than one list of the same width.
+	for b := a.b; len(b) != 0; {
+		n := int(b[0]) + 1
+		if n < 2 || n > len(b) {
+			return false
+		}
+		var list *uuidList
+		switch b[1] {
+		case typeSomeUUID16, typeAllUUID16:
+			list = &small
+		case typeSomeUUID128, typeAllUUID128:
+			list = &large
+		}
+		if list == nil {
+			fields = append(fields, field{raw: b[:n]})
+			size += n
+		} else {
+			if (n-2)%list.width != 0 {
+				return false
+			}
+			if !list.present {
+				list.present = true
+				fields = append(fields, field{list: list})
+				size += 2
+			}
+			list.data = append(list.data, b[2:n]...)
+			size += n - 2
+			if b[1] == typeSomeUUID16 || b[1] == typeSomeUUID128 {
+				list.complete = false
+			}
+		}
+		b = b[n:]
+	}
+
+	blocked := false
 	for _, u := range uu {
 		if u.Equal(attrGAPUUID) || u.Equal(attrGATTUUID) {
 			continue
 		}
-		if len(a.b)+2+u.Len() > MaxEIRPacketLength {
-			break
+		var list *uuidList
+		switch u.Len() {
+		case 2:
+			list = &small
+		case 16:
+			list = &large
+		default:
+			continue
 		}
-		switch l = u.Len(); {
-		case l == 2 && fit:
-			a.AppendField(typeAllUUID16, u.b)
-		case l == 16 && fit:
-			a.AppendField(typeAllUUID128, u.b)
-		case l == 2 && !fit:
-			a.AppendField(typeSomeUUID16, u.b)
-		case l == 16 && !fit:
-			a.AppendField(typeSomeUUID128, u.b)
+		cost := list.width
+		if !list.present {
+			cost += 2
 		}
+		if blocked || size+cost > MaxEIRPacketLength {
+			fit, blocked, list.complete = false, true, false
+			continue
+		}
+		if !list.present {
+			list.present = true
+			fields = append(fields, field{list: list})
+			size += 2
+		}
+		list.data = append(list.data, u.b...)
+		size += list.width
 	}
+	packet := make([]byte, 0, size)
+	for _, f := range fields {
+		if f.list == nil {
+			packet = append(packet, f.raw...)
+			continue
+		}
+		typ := byte(typeSomeUUID16)
+		if f.list.width == 16 {
+			typ = typeSomeUUID128
+		}
+		if f.list.complete {
+			if f.list.width == 2 {
+				typ = typeAllUUID16
+			} else {
+				typ = typeAllUUID128
+			}
+		}
+		packet = append(packet, byte(len(f.list.data)+1), typ)
+		packet = append(packet, f.list.data...)
+	}
+	a.b = packet
 	return fit
 }

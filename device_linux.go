@@ -116,7 +116,7 @@ func (d *device) Init(f func(Device, State)) error {
 		d.mu.Lock()
 		attrs := d.attrs
 		d.mu.Unlock()
-		c := newCentral(attrs, net.HardwareAddr([]byte{a[5], a[4], a[3], a[2], a[1], a[0]}), pd.Conn)
+		c := newCentral(attrs, net.HardwareAddr(a[:]), pd.Conn)
 		c.requestSlots, c.callbackSlots = d.requestSlots, d.callbackSlots
 		stopCancel := context.AfterFunc(d.ctx, c.cancel)
 		d.runConnection(c.Context(), true, func() {
@@ -342,23 +342,27 @@ func (d *device) Advertise(a *AdvPacket) error {
 }
 
 func (d *device) AdvertiseNameAndServices(name string, uu []UUID) error {
+	a, scan := nameAndServicesPackets(name, uu)
+	d.scanResp = scan
+	return d.Advertise(a)
+}
+
+// Keep packet construction independent of controller IO so a replacement can
+// explicitly clear the previous scan response when the name fits in advertising.
+func nameAndServicesPackets(name string, uu []UUID) (*AdvPacket, *cmd.LESetScanResponseData) {
 	a := &AdvPacket{}
 	a.AppendFlags(flagGeneralDiscoverable | flagLEOnly)
 	a.AppendUUIDFit(uu)
 
 	if len(a.b)+len(name)+2 < MaxEIRPacketLength {
 		a.AppendName(name)
-		d.scanResp = nil
-	} else {
-		a := &AdvPacket{}
-		a.AppendName(name)
-		d.scanResp = &cmd.LESetScanResponseData{
-			ScanResponseDataLength: uint8(a.Len()),
-			ScanResponseData:       a.Bytes(),
-		}
+		return a, &cmd.LESetScanResponseData{}
 	}
-
-	return d.Advertise(a)
+	scan := (&AdvPacket{}).AppendName(name)
+	return a, &cmd.LESetScanResponseData{
+		ScanResponseDataLength: uint8(scan.Len()),
+		ScanResponseData:       scan.Bytes(),
+	}
 }
 
 func (d *device) AdvertiseIBeaconData(b []byte) error {
@@ -486,6 +490,9 @@ func (d *device) CancelConnection(p Peripheral) {
 }
 
 func (d *device) SendHCIRawCommand(c cmd.CmdParam) ([]byte, error) {
+	if d == nil || d.hci == nil {
+		return nil, errors.New("device is not initialized")
+	}
 	return d.hci.SendRawCommand(c)
 }
 

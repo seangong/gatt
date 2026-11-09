@@ -435,6 +435,7 @@ func shutdownTestCommandComplete(d *shutdownTestTransport, opcode uint16, status
 func TestHCIConnectionRejectsExhaustedCallbackCapacity(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newShutdownTestHCI(t, false)
+		h.adv = true
 		release := make(chan struct{})
 		defer close(release)
 		for i := 0; i < cap(h.callbacks); i++ {
@@ -475,6 +476,7 @@ func TestHCIConnectionInitializationFailureCleansUp(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				h, d := newShutdownTestHCI(t, false)
+				h.adv = true
 				if stage == "connection parameters" {
 					d.aclError = errors.New("connection parameter transport failed")
 				}

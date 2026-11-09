@@ -213,6 +213,7 @@ func TestHCICancelPendingConnectionHandlesSuccessfulConnectionRace(t *testing.T)
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				h, d := newShutdownTestHCI(t, false)
+				h.adv = true
 				accepted := make(chan *PlatData, 1)
 				h.AcceptSlaveHandler = func(pd *PlatData) { accepted <- pd }
 				pd := &PlatData{Address: [6]byte{1, 2, 3, 4, 5, 6}}

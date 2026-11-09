@@ -157,7 +157,7 @@ func TestAppendUUIDFit(t *testing.T) {
 		},
 		{
 			uu:      []UUID{UUID16(0xFAFE), UUID16(0xFAF9)},
-			want:    "0201060303fefa0303f9fa",
+			want:    "0201060503fefaf9fa",
 			wantFit: true,
 		},
 		{
@@ -179,7 +179,8 @@ func TestAppendUUIDFit(t *testing.T) {
 				UUID16(0xeeee), UUID16(0xffff),
 				UUID16(0xaaaa), UUID16(0xbbbb),
 			},
-			want: "0201060302aaaa0302bbbb0302cccc0302dddd0302eeee0302ffff0302aaaa",
+			want:    "0201061103aaaabbbbccccddddeeeeffffaaaabbbb",
+			wantFit: true,
 		},
 		{
 			uu:      []UUID{attrGAPUUID, UUID16(0xFAFE), attrGATTUUID},

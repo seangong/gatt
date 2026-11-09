@@ -194,11 +194,33 @@ func TestDarwinClientReconnectBeforeOldStopPublishes(t *testing.T) {
 }
 
 func TestDarwinClientRepeatedConnectPreservesActiveSession(t *testing.T) {
+	for _, kind := range []string{"live", "scan-alias", "new-peripheral", "retired-alias"} {
+		t.Run(kind, func(t *testing.T) { testDarwinRepeatedConnectPreservesActiveSession(t, kind) })
+	}
+}
+
+func testDarwinRepeatedConnectPreservesActiveSession(t *testing.T, kind string) {
+	t.Helper()
 	commands := make(chan int, 4)
 	d, live := newDarwinClientTest(t, func(id int, _ xpc.Dict) (int, xpc.Dict) {
 		commands <- id
 		return 0, nil
 	})
+	argument := live
+	switch kind {
+	case "scan-alias":
+		argument = &peripheral{id: live.id, d: d}
+	case "new-peripheral":
+		argument = NewPeripheral(UUID{live.id}).(*peripheral)
+	case "retired-alias":
+		argument = &peripheral{id: live.id, d: d}
+		argument.ctx, argument.cancel = context.WithCancelCause(d.ctx)
+		argument.stop(io.ErrClosedPipe)
+	}
+	service := &Service{h: 1, endh: 10}
+	live.svcs = []*Service{service}
+	notified := make(chan string, 1)
+	live.sub.subscribe(2, func(b []byte, _ error) { notified <- string(b) })
 	type readResult struct {
 		value []byte
 		err   error
@@ -212,15 +234,28 @@ func TestDarwinClientRepeatedConnectPreservesActiveSession(t *testing.T) {
 	if id := receiveDarwin(t, commands); id != 65 {
 		t.Fatalf("read command = %d", id)
 	}
-	d.Connect(live)
+	d.Connect(argument)
 	if id := receiveDarwin(t, commands); id != 31 {
 		t.Fatalf("repeated connect command = %d", id)
+	}
+	d.plistmu.Lock()
+	current := d.plist[live.ID()]
+	d.plistmu.Unlock()
+	if current != live || len(live.Services()) != 1 || live.Services()[0] != service {
+		t.Fatal("repeated connect replaced the active session or its cache")
 	}
 	d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(characteristicRead), "kCBMsgArgs": xpc.Dict{
 		"kCBMsgArgDeviceUUID": live.id, "kCBMsgArgResult": int64(0), "kCBMsgArgData": []byte("active"),
 	}}, nil)
 	if got := receiveDarwin(t, reads); got.err != nil || string(got.value) != "active" {
 		t.Fatalf("read during repeated connect = %q, %v", got.value, got.err)
+	}
+	d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(characteristicRead), "kCBMsgArgs": xpc.Dict{
+		"kCBMsgArgDeviceUUID": live.id, "kCBMsgArgIsNotification": int64(1),
+		"kCBMsgArgCharacteristicHandle": int64(2), "kCBMsgArgData": []byte("notification"),
+	}}, nil)
+	if got := receiveDarwin(t, notified); got != "notification" {
+		t.Fatalf("notification after repeated connect = %q", got)
 	}
 	go read()
 	if id := receiveDarwin(t, commands); id != 65 {
@@ -233,5 +268,263 @@ func TestDarwinClientRepeatedConnectPreservesActiveSession(t *testing.T) {
 	d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralDisconnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": live.id}}, nil)
 	if got := receiveDarwin(t, reads); !errors.Is(got.err, io.ErrClosedPipe) || context.Cause(live.context()) == nil {
 		t.Fatalf("active request after disconnection = %v", got.err)
+	}
+}
+
+func TestDarwinClientRepeatedConnectedEventPreservesActiveSession(t *testing.T) {
+	commands := make(chan int, 2)
+	d, live := newDarwinClientTest(t, func(id int, _ xpc.Dict) (int, xpc.Dict) {
+		commands <- id
+		return 0, nil
+	})
+	connected := make(chan Peripheral, 2)
+	d.peripheralConnected = func(p Peripheral, _ error) { connected <- p }
+	reads := make(chan error, 1)
+	go func() {
+		_, err := live.ReadCharacteristic(&Characteristic{h: 2, vh: 3})
+		reads <- err
+	}()
+	if id := receiveDarwin(t, commands); id != 65 {
+		t.Fatalf("read command = %d", id)
+	}
+	d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralConnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": live.id}}, nil)
+	d.plistmu.Lock()
+	current := d.plist[live.ID()]
+	d.plistmu.Unlock()
+	if current != live {
+		t.Fatal("duplicate connected event replaced the active owner")
+	}
+	d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(characteristicRead), "kCBMsgArgs": xpc.Dict{
+		"kCBMsgArgDeviceUUID": live.id, "kCBMsgArgResult": int64(0), "kCBMsgArgData": []byte("active"),
+	}}, nil)
+	if err := receiveDarwin(t, reads); err != nil {
+		t.Fatalf("read after duplicate connected event = %v", err)
+	}
+	select {
+	case p := <-connected:
+		t.Fatalf("duplicate connected event reported another connection: %s", p.ID())
+	default:
+	}
+}
+
+func TestDarwinClientRepeatedConnectPreservesPendingSource(t *testing.T) {
+	for _, reconnect := range []bool{false, true} {
+		for _, outcome := range []string{"success", "cancel", "session-error", "enqueue-error"} {
+			t.Run(map[bool]string{false: "scan", true: "reconnect"}[reconnect]+"/"+outcome, func(t *testing.T) {
+				commands := make(chan int, 5)
+				d, old := newDarwinClientTest(t, func(id int, _ xpc.Dict) (int, xpc.Dict) {
+					commands <- id
+					return 0, nil
+				})
+				d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralDisconnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": old.id}}, nil)
+				source := old
+				if !reconnect {
+					source = &peripheral{id: old.id, d: d}
+				}
+				type result struct {
+					p   Peripheral
+					err error
+				}
+				connected, disconnected := make(chan result, 3), make(chan result, 2)
+				d.peripheralConnected = func(p Peripheral, err error) { connected <- result{p, err} }
+				d.peripheralDisconnected = func(p Peripheral, err error) { disconnected <- result{p, err} }
+				d.Connect(source)
+				if id := receiveDarwin(t, commands); id != 31 {
+					t.Fatalf("initial connect command = %d", id)
+				}
+				d.plistmu.Lock()
+				pending := d.plist[source.ID()]
+				d.plistmu.Unlock()
+				alias := &peripheral{id: source.id, d: d}
+				retired := &peripheral{id: source.id, d: d}
+				retired.ctx, retired.cancel = context.WithCancelCause(d.ctx)
+				retired.stop(io.ErrClosedPipe)
+				for _, argument := range []*peripheral{source, alias, retired} {
+					d.Connect(argument)
+					if id := receiveDarwin(t, commands); id != 31 {
+						t.Fatalf("repeated connect command = %d", id)
+					}
+					d.plistmu.Lock()
+					current := d.plist[source.ID()]
+					d.plistmu.Unlock()
+					if current != pending || reconnect && current.connectSource != source {
+						t.Fatal("repeated connect replaced the pending owner or its original source")
+					}
+				}
+				switch outcome {
+				case "success":
+					d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralConnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": source.id}}, nil)
+					got := receiveDarwin(t, connected)
+					if got.err != nil || got.p == source || context.Cause(got.p.(*peripheral).context()) != nil {
+						t.Fatalf("connection result = %+v", got)
+					}
+					d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralConnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": source.id}}, nil)
+					d.plistmu.Lock()
+					current := d.plist[source.ID()]
+					d.plistmu.Unlock()
+					if current != got.p {
+						t.Fatal("duplicate connected event replaced the published connection")
+					}
+					d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralDisconnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": source.id}}, nil)
+					if ended := receiveDarwin(t, disconnected); ended.p != got.p || ended.err != nil || context.Cause(current.context()) == nil {
+						t.Fatalf("disconnection result = %+v", ended)
+					}
+				case "cancel":
+					d.CancelConnection(source)
+					if id := receiveDarwin(t, commands); id != 32 {
+						t.Fatalf("pending cancel command = %d", id)
+					}
+					d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralConnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": source.id}}, nil)
+					d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralDisconnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": source.id}}, nil)
+					if ended := receiveDarwin(t, disconnected); ended.p != source || ended.err != nil {
+						t.Fatalf("pending cancellation result = %+v", ended)
+					}
+				default:
+					cause := xpc.CONNECTION_INTERRUPTED
+					if outcome == "enqueue-error" {
+						cause = xpc.ErrClosed
+						d.conn = xpc.XPC{}
+						d.Connect(alias)
+					} else {
+						d.HandleXpcEvent(nil, cause)
+					}
+					if got := receiveDarwin(t, connected); got.p != source || !errors.Is(got.err, cause) {
+						t.Fatalf("failed pending connection result = %+v", got)
+					}
+				}
+				select {
+				case got := <-connected:
+					t.Fatalf("unexpected additional connection callback: %+v", got)
+				case got := <-disconnected:
+					t.Fatalf("unexpected additional disconnection callback: %+v", got)
+				default:
+				}
+			})
+		}
+	}
+}
+
+func TestDarwinClientReconnectAfterPendingCancellation(t *testing.T) {
+	for _, outcome := range []string{"success", "cancel", "session-error", "enqueue-error"} {
+		t.Run(outcome, func(t *testing.T) {
+			commands := make(chan int, 3)
+			d, old := newDarwinClientTest(t, func(id int, _ xpc.Dict) (int, xpc.Dict) {
+				commands <- id
+				return 0, nil
+			})
+			d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralDisconnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": old.id}}, nil)
+			source := &peripheral{id: old.id, d: d}
+			d.Connect(source)
+			if id := receiveDarwin(t, commands); id != 31 {
+				t.Fatalf("initial connect command = %d", id)
+			}
+			d.CancelConnection(source)
+			if id := receiveDarwin(t, commands); id != 32 {
+				t.Fatalf("initial cancel command = %d", id)
+			}
+			d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralDisconnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": source.id}}, nil)
+			type result struct {
+				p   Peripheral
+				err error
+			}
+			connected, disconnected := make(chan result, 2), make(chan result, 2)
+			d.peripheralConnected = func(p Peripheral, err error) { connected <- result{p, err} }
+			d.peripheralDisconnected = func(p Peripheral, err error) { disconnected <- result{p, err} }
+			d.Connect(source)
+			if id := receiveDarwin(t, commands); id != 31 {
+				t.Fatalf("reconnect command = %d", id)
+			}
+			d.plistmu.Lock()
+			pending := d.plist[source.ID()]
+			d.plistmu.Unlock()
+			if pending == source || pending == nil || pending.connectSource != source || pending.closing || !source.closing || source.cancel != nil {
+				t.Fatal("reconnect reused or reset the canceled pending object")
+			}
+			switch outcome {
+			case "success":
+				d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralConnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": source.id}}, nil)
+				got := receiveDarwin(t, connected)
+				if got.err != nil || got.p == source || context.Cause(got.p.(*peripheral).context()) != nil {
+					t.Fatalf("reconnect after pending cancellation = %+v", got)
+				}
+			case "cancel":
+				d.CancelConnection(source)
+				if id := receiveDarwin(t, commands); id != 32 {
+					t.Fatalf("reconnect cancel command = %d", id)
+				}
+				d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralConnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": source.id}}, nil)
+				d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralDisconnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": source.id}}, nil)
+				if got := receiveDarwin(t, disconnected); got.p != source || got.err != nil {
+					t.Fatalf("reconnect cancellation result = %+v", got)
+				}
+			default:
+				cause := xpc.CONNECTION_INTERRUPTED
+				if outcome == "enqueue-error" {
+					cause = xpc.ErrClosed
+					d.conn = xpc.XPC{}
+					d.Connect(source)
+				} else {
+					d.HandleXpcEvent(nil, cause)
+				}
+				if got := receiveDarwin(t, connected); got.p != source || !errors.Is(got.err, cause) {
+					t.Fatalf("failed reconnect result = %+v", got)
+				}
+			}
+			select {
+			case got := <-connected:
+				t.Fatalf("unexpected additional connection callback: %+v", got)
+			case got := <-disconnected:
+				t.Fatalf("unexpected additional disconnection callback: %+v", got)
+			default:
+			}
+		})
+	}
+}
+
+func TestDarwinClientDiscoveryAndConnectionPreserveName(t *testing.T) {
+	for _, tc := range []struct {
+		name, advertised, fallback, connected, want string
+	}{
+		{name: "advertised", advertised: "Printer", want: "Printer"},
+		{name: "fallback", fallback: "GAP name", want: "GAP name"},
+		{name: "native connection name", advertised: "Printer", connected: "Printer 2", want: "Printer 2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, old := newDarwinClientTest(t, func(id int, _ xpc.Dict) (int, xpc.Dict) {
+				if id == 31 {
+					return peripheralConnected, xpc.Dict{"kCBMsgArgName": tc.connected}
+				}
+				return 0, nil
+			})
+			d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralDisconnected), "kCBMsgArgs": xpc.Dict{"kCBMsgArgDeviceUUID": old.id}}, nil)
+			discovered, connected := make(chan Peripheral, 1), make(chan Peripheral, 1)
+			d.peripheralDiscovered = func(p Peripheral, _ *Advertisement, _ int) { discovered <- p }
+			d.peripheralConnected = func(p Peripheral, err error) {
+				if err != nil {
+					t.Errorf("connection failed: %v", err)
+				}
+				connected <- p
+			}
+			advertisement := xpc.Dict{"kCBAdvDataTxPowerLevel": int64(0)}
+			if tc.advertised != "" {
+				advertisement["kCBAdvDataLocalName"] = tc.advertised
+			}
+			d.HandleXpcEvent(xpc.Dict{"kCBMsgId": int64(peripheralDiscovered), "kCBMsgArgs": xpc.Dict{
+				"kCBMsgArgDeviceUUID": old.id, "kCBMsgArgRssi": int64(-40),
+				"kCBMsgArgName": tc.fallback, "kCBMsgArgAdvertisementData": advertisement,
+			}}, nil)
+			source := receiveDarwin(t, discovered)
+			name := tc.advertised
+			if name == "" {
+				name = tc.fallback
+			}
+			if got := source.Name(); got != name {
+				t.Errorf("discovered name = %q, want %q", got, name)
+			}
+			d.Connect(source)
+			if got := receiveDarwin(t, connected); got == source || got.Name() != tc.want || source.Name() != name {
+				t.Fatalf("connected name = %q, want %q; source name = %q", got.Name(), tc.want, source.Name())
+			}
+		})
 	}
 }

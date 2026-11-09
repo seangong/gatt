@@ -47,6 +47,10 @@ type peripheral struct {
 	callout      func(func()) bool
 	metadataOnce sync.Once
 	metadataGate chan struct{}
+	responseMu   sync.Mutex
+	// responsePending is registered before Write and cleared before its reader
+	// acknowledgement. Only the request owner changes it, under responseMu.
+	responsePending bool
 
 	pd *linux.PlatData // platform specific data
 }
@@ -589,6 +593,11 @@ func (p *peripheral) send(op byte, b []byte, noRsp bool) peripheralResult {
 }
 
 func (p *peripheral) requestLoop(rspc <-chan []byte, processed chan<- uint16) {
+	defer func() {
+		p.responseMu.Lock()
+		p.responsePending = false
+		p.responseMu.Unlock()
+	}()
 	done := p.connectionDone()
 	for {
 		var req message
@@ -616,6 +625,13 @@ func (p *peripheral) requestLoop(rspc <-chan []byte, processed chan<- uint16) {
 				continue
 			}
 		}
+		if !req.noRsp {
+			// A peer can respond before the transport's Write returns. Register
+			// this transaction first, without holding the mutex across IO.
+			p.responseMu.Lock()
+			p.responsePending = true
+			p.responseMu.Unlock()
+		}
 		n, err := p.l2c.Write(req.b)
 		if err == nil && n != len(req.b) {
 			err = io.ErrShortWrite
@@ -642,6 +658,9 @@ func (p *peripheral) requestLoop(rspc <-chan []byte, processed chan<- uint16) {
 			case result.b = <-rspc:
 				timer.Stop()
 			}
+			p.responseMu.Lock()
+			p.responsePending = false
+			p.responseMu.Unlock()
 			if err := validPeripheralResponse(req.op, result.b, result.mtu); err != nil {
 				p.abort(err)
 				return
@@ -773,6 +792,14 @@ func (p *peripheral) readLoop(rspc chan<- []byte, processed <-chan uint16, recei
 		copy(b, buf)
 
 		if (b[0] != attOpHandleNotify) && (b[0] != attOpHandleInd) {
+			p.responseMu.Lock()
+			pending := p.responsePending
+			p.responseMu.Unlock()
+			if !pending {
+				// An idle response cannot belong to a future transaction or
+				// keep notifications queued behind a response handoff.
+				continue
+			}
 			select {
 			case <-p.quitc:
 				return

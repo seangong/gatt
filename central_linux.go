@@ -43,6 +43,9 @@ type pendingIndication struct {
 const indicationTimeout = 30 * time.Second
 
 func newCentral(a *attrRange, addr net.HardwareAddr, l2conn io.ReadWriteCloser) *central {
+	if a == nil {
+		a = &attrRange{base: 1}
+	}
 	ctx := context.Background()
 	if conn, ok := l2conn.(interface{ Context() context.Context }); ok {
 		ctx = conn.Context()
@@ -245,6 +248,9 @@ func (c *central) handleReq(b []byte) []byte {
 		return nil
 	}
 	reqType, req := b[0], b[1:]
+	if reqType&0x40 != 0 && reqType != attOpWriteCmd {
+		return nil // Unsupported commands never generate ATT responses.
+	}
 	if reqType == attOpHandleCnf {
 		if len(req) == 0 {
 			c.confirmIndication()
@@ -387,10 +393,9 @@ func (c *central) handleFindByTypeValue(b []byte) []byte {
 		if !(UUID{a.value}.Equal(u)) {
 			continue
 		}
-		s := a.pvt.(*Service)
 		w.Chunk()
-		w.WriteUint16Fit(s.h)
-		w.WriteUint16Fit(s.endh)
+		w.WriteUint16Fit(a.h)
+		w.WriteUint16Fit(a.groupEnd)
 		if ok := w.Commit(); !ok {
 			break
 		}
@@ -423,13 +428,7 @@ func (c *central) readValue(a attr, capacity, offset int) ([]byte, attEcode) {
 		}
 		return v[offset:], attEcodeSuccess
 	}
-	var handler ReadHandler
-	switch target := a.pvt.(type) {
-	case *Characteristic:
-		handler = target.rhandler
-	case *Descriptor:
-		handler = target.rhandler
-	}
+	handler := a.rhandler
 	if handler == nil {
 		return nil, attEcodeUnlikely
 	}
@@ -577,10 +576,9 @@ func (c *central) handleReadByGroup(b []byte) []byte {
 		if uuidLen != len(a.value) {
 			break
 		}
-		s := a.pvt.(*Service)
 		w.Chunk()
-		w.WriteUint16Fit(s.h)
-		w.WriteUint16Fit(s.endh)
+		w.WriteUint16Fit(a.h)
+		w.WriteUint16Fit(a.groupEnd)
 		w.WriteFit(a.value)
 		if ok := w.Commit(); !ok {
 			break
@@ -622,16 +620,15 @@ func (c *central) handleWrite(reqType byte, b []byte) []byte {
 	// (Characteristic's value is implemented with descriptor)
 	if !a.typ.Equal(attrClientCharacteristicConfigUUID) {
 		// Regular write, not CCC
+		handler := a.whandler
+		if handler == nil {
+			return attErrorRsp(reqType, h, attEcodeUnlikely)
+		}
 		r := Request{Central: c}
 		value = append([]byte(nil), value...)
 		status := byte(StatusUnexpectedError)
 		if !c.callHandler(func() {
-			switch target := a.pvt.(type) {
-			case *Characteristic:
-				status = target.whandler.ServeWrite(r, value)
-			case *Descriptor:
-				status = target.whandler.ServeWrite(r, value)
-			}
+			status = handler.ServeWrite(r, value)
 		}) {
 			return attErrorRsp(reqType, h, attEcodeUnlikely)
 		}
@@ -649,10 +646,9 @@ func (c *central) handleWrite(reqType byte, b []byte) []byte {
 		return attErrorRsp(reqType, h, attEcodeInvalAttrValueLen)
 	}
 	ccc := binary.LittleEndian.Uint16(value)
-	char := a.pvt.(*Descriptor).char
 	if ccc & ^uint16(gattCCCNotifyFlag|gattCCCIndicateFlag) != 0 ||
-		ccc&gattCCCNotifyFlag != 0 && char.props&CharNotify == 0 ||
-		ccc&gattCCCIndicateFlag != 0 && char.props&CharIndicate == 0 {
+		ccc&gattCCCNotifyFlag != 0 && a.notifyProps&CharNotify == 0 ||
+		ccc&gattCCCIndicateFlag != 0 && a.notifyProps&CharIndicate == 0 {
 		return attErrorRsp(reqType, h, attEcodeValueNotAllowed)
 	}
 	if ccc&(gattCCCNotifyFlag|gattCCCIndicateFlag) != 0 {
@@ -707,7 +703,7 @@ func (c *central) sendNotification(n *notifier, data []byte) (int, error) {
 	c.notifiersmu.Unlock()
 	w := newL2capWriter(mtu)
 	w.WriteByteFit(op)
-	w.WriteUint16Fit(n.a.pvt.(*Descriptor).char.vh)
+	w.WriteUint16Fit(n.a.valueHandle)
 	w.WriteFit(data)
 	packet := w.Bytes()
 	written, err := c.l2conn.Write(packet)
@@ -753,11 +749,13 @@ func (c *central) startNotify(a *attr, maxlen int, ccc uint16) bool {
 		n.ccc = ccc
 		return true
 	}
-	char := a.pvt.(*Descriptor).char
+	if a.nhandler == nil {
+		return false
+	}
 	n := newNotifier(c, a, maxlen)
 	n.ccc = ccc
 	c.notifiers[a.h] = n
-	if !startCallout(c.callbackSlots, func() { char.nhandler.ServeNotify(Request{Central: c}, n) }) {
+	if !startCallout(c.callbackSlots, func() { a.nhandler.ServeNotify(Request{Central: c}, n) }) {
 		delete(c.notifiers, a.h)
 		n.stop()
 		return false

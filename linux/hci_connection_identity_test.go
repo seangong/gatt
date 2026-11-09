@@ -128,6 +128,7 @@ func connectionIdentityCancelRetired(t *testing.T, h *HCI, d *shutdownTestTransp
 func TestHCIOriginalPeripheralConnectionIdentity(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newShutdownTestHCI(t, false)
+		h.adv = true
 		reports, accepted := make(chan *PlatData, 4), make(chan *PlatData, 2)
 		h.AdvertisementHandler = func(pd *PlatData) { reports <- pd }
 		h.AcceptSlaveHandler = func(pd *PlatData) { accepted <- pd }
@@ -157,6 +158,7 @@ func TestHCIOriginalPeripheralConnectionIdentity(t *testing.T) {
 func TestHCIInboundCompletionPreservesPendingConnectionIdentity(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newShutdownTestHCI(t, false)
+		h.adv = true
 		reports, outbound, inbound := make(chan *PlatData, 2), make(chan *PlatData, 1), make(chan *PlatData, 1)
 		h.AdvertisementHandler = func(pd *PlatData) { reports <- pd }
 		h.AcceptSlaveHandler = func(pd *PlatData) { outbound <- pd }
@@ -188,6 +190,7 @@ func TestHCIInboundCompletionPreservesPendingConnectionIdentity(t *testing.T) {
 func TestHCIRejectedAttemptClearsConnectionIdentity(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newShutdownTestHCI(t, false)
+		h.adv = true
 		reports, accepted := make(chan *PlatData, 2), make(chan *PlatData, 1)
 		h.AdvertisementHandler = func(pd *PlatData) { reports <- pd }
 		h.AcceptSlaveHandler = func(pd *PlatData) { accepted <- pd }
@@ -206,6 +209,7 @@ func TestHCIRejectedAttemptClearsConnectionIdentity(t *testing.T) {
 func TestHCIReusedConnectedPeripheralConnectionIdentity(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newShutdownTestHCI(t, false)
+		h.adv = true
 		reports, accepted := make(chan *PlatData, 1), make(chan *PlatData, 1)
 		h.AdvertisementHandler = func(pd *PlatData) { reports <- pd }
 		h.AcceptSlaveHandler = func(pd *PlatData) { accepted <- pd }

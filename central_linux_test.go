@@ -126,8 +126,8 @@ func TestServing(t *testing.T) {
 		},
 		{
 			name: "bad req -- unsupported",
-			send: "FF1234567890",
-			want: "01ff000006",
+			send: "3F1234567890",
+			want: "013f000006",
 		},
 		{
 			name: "find info [1,10] -- 1: 0x2800, 2: 0x2803, 3: 0x2a00, 4: 0x2803, 5: 0x2a01",

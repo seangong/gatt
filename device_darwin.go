@@ -56,6 +56,16 @@ type device struct {
 
 	subscribers   map[string]*central
 	subscribersmu sync.Mutex
+
+	attOnce  sync.Once
+	attQueue chan darwinATTRequest
+	attDone  chan struct{}
+	attMu    sync.Mutex // Order local ATT response enqueue with session cancellation.
+}
+
+type darwinATTRequest struct {
+	id   int
+	args xpc.Dict
 }
 
 func NewDevice(opts ...Option) (Device, error) {
@@ -390,7 +400,8 @@ func (d *device) Connect(p Peripheral) {
 		}
 		return
 	}
-	if previous := d.plist[pp.ID()]; previous != nil &&
+	previous := d.plist[pp.ID()]
+	if previous != nil &&
 		(previous.closing || previous.cancel != nil && context.Cause(previous.context()) != nil) {
 		err := context.Cause(previous.context())
 		if err == nil {
@@ -402,13 +413,18 @@ func (d *device) Connect(p Peripheral) {
 		}
 		return
 	}
-	pending := pp
-	if pp.cancel != nil && d.plist[pp.ID()] != pp {
-		// A connected object owns its original context and caches, even after
-		// removal from the registry. Reconnection must not reuse its state.
-		pending = &peripheral{id: pp.id, d: d, name: pp.name, connectSource: pp}
+	if previous == nil {
+		pending := pp
+		if pp.cancel != nil || pp.closing {
+			// A connected object owns its original context and caches, even after
+			// removal from the registry. Reconnection must not reuse its state.
+			// A canceled pending object also keeps its original closing marker.
+			pending = &peripheral{id: pp.id, d: d, name: pp.name, connectSource: pp}
+		}
+		d.plist[pp.id.String()] = pending
 	}
-	d.plist[pp.id.String()] = pending
+	// Repeated connects still send the native command, but keep the current
+	// UUID owner and the original source of a pending reconnect.
 	// Registration and local enqueue share the registry lock so cancellation
 	// cannot overtake this connect. SendError does not wait for peer callbacks.
 	err := d.conn.SendError(xpc.Dict{"kCBMsgId": 31, "kCBMsgArgs": xpc.Dict{
@@ -423,8 +439,49 @@ func (d *device) Connect(p Peripheral) {
 	}
 }
 
-func (d *device) respondToRequest(id int, args xpc.Dict) {
+// Native reception must stay available while an ATT handler calls synchronous
+// device APIs. One worker preserves business request order without unbounded
+// goroutines; subscriptions and native operation responses stay on the receiver.
+func (d *device) queueATTRequest(id int, args xpc.Dict) {
+	if context.Cause(d.ctx) != nil {
+		return
+	}
+	d.attOnce.Do(func() {
+		d.attQueue = make(chan darwinATTRequest, 16)
+		d.attDone = make(chan struct{})
+		go func() {
+			defer close(d.attDone)
+			for {
+				select {
+				case <-d.ctx.Done():
+					return
+				case request := <-d.attQueue:
+					if context.Cause(d.ctx) != nil {
+						return
+					}
+					d.respondToRequest(request.id, request.args)
+				}
+			}
+		}()
+	})
+	select {
+	case <-d.ctx.Done():
+	case d.attQueue <- darwinATTRequest{id: id, args: args}:
+	default:
+		// Preserve protocol validation and write-command response suppression,
+		// but do not run any business handler when the queue has no capacity.
+		d.respondToRequestStatus(id, args, attEcodeInsuffResources)
+	}
+}
 
+func (d *device) respondToRequest(id int, args xpc.Dict) {
+	d.respondToRequestStatus(id, args, attEcodeSuccess)
+}
+
+func (d *device) respondToRequestStatus(id int, args xpc.Dict, forcedStatus attEcode) {
+	if (id == 19 || id == 20) && context.Cause(d.ctx) != nil {
+		return
+	}
 	switch id {
 	case 19: // ReadRequest
 		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
@@ -455,7 +512,12 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 			}
 			if handler == nil {
 				code = attEcodeReadNotPerm
+			} else if forcedStatus != attEcodeSuccess {
+				code = forcedStatus
 			} else {
+				if context.Cause(d.ctx) != nil {
+					return
+				}
 				c := newCentral(d, u)
 				req := &ReadRequest{
 					Request: Request{Central: c},
@@ -469,6 +531,11 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 					v = rsp.bytes()
 				}
 			}
+		} else if forcedStatus != attEcodeSuccess {
+			code = forcedStatus
+		}
+		if code != attEcodeSuccess {
+			v = nil
 		}
 		d.respondATT(a, t, v, code)
 
@@ -539,7 +606,12 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 					}
 					if handler == nil {
 						code = attEcodeWriteNotPerm
+					} else if forcedStatus != attEcodeSuccess {
+						code = forcedStatus
 					} else {
+						if context.Cause(d.ctx) != nil {
+							return
+						}
 						u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
 						code = attErrorForStatus(handler.ServeWrite(Request{Central: newCentral(d, u)}, b))
 					}
@@ -590,12 +662,21 @@ func (d *device) respondToRequest(id int, args xpc.Dict) {
 }
 
 func (d *device) respondATT(attribute, transaction int, value []byte, code attEcode) {
-	d.sendCmd(13, xpc.Dict{
+	d.attMu.Lock()
+	if context.Cause(d.ctx) != nil {
+		d.attMu.Unlock()
+		return
+	}
+	err := d.conn.SendError(xpc.Dict{"kCBMsgId": 13, "kCBMsgArgs": xpc.Dict{
 		"kCBMsgArgAttributeID":   attribute,
 		"kCBMsgArgData":          value,
 		"kCBMsgArgTransactionID": transaction,
 		"kCBMsgArgResult":        int(code),
-	})
+	}}, false)
+	d.attMu.Unlock()
+	if err != nil {
+		d.fail(err)
+	}
 }
 
 func (d *device) CancelConnection(p Peripheral) {
@@ -658,7 +739,9 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 
 	case
 		19, // ReadRequest
-		20, // WriteRequest
+		20: // WriteRequest
+		d.queueATTRequest(id, args)
+	case
 		21, // Subscribe
 		22, // Unubscribe
 		23: // Confirmation
@@ -695,15 +778,16 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 			}
 		}
 		if d.peripheralDiscovered != nil {
-			go d.peripheralDiscovered(&peripheral{id: xpc.UUID(u.b), d: d}, a, rssi)
+			go d.peripheralDiscovered(&peripheral{id: xpc.UUID(u.b), d: d, name: a.LocalName}, a, rssi)
 		}
 
 	case peripheralConnected:
 		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
 		p := &peripheral{
-			id:  xpc.UUID(u.b),
-			d:   d,
-			sub: newSubscriber(),
+			id:   xpc.UUID(u.b),
+			d:    d,
+			sub:  newSubscriber(),
+			name: args.GetString("kCBMsgArgName", ""),
 		}
 		p.ctx, p.cancel = context.WithCancelCause(d.ctx)
 		d.plistmu.Lock()
@@ -712,11 +796,17 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 			p.stop(err)
 			return
 		}
-		if previous := d.plist[p.ID()]; previous != nil &&
-			(previous.closing || previous.cancel != nil && context.Cause(previous.context()) != nil) {
+		// A UUID has one connected owner. A repeated native success must not
+		// replace its pending requests, discovery cache or subscriptions.
+		previous := d.plist[p.ID()]
+		if previous != nil &&
+			(previous.closing || previous.cancel != nil) {
 			d.plistmu.Unlock()
 			p.stop(io.ErrClosedPipe)
 			return
+		}
+		if p.name == "" && previous != nil {
+			p.name = previous.name
 		}
 		d.plist[xpc.UUID(u.b).String()] = p
 		d.plistmu.Unlock()
@@ -794,7 +884,9 @@ func (d *device) fail(err error) {
 	if err == nil {
 		err = io.ErrClosedPipe
 	}
+	d.attMu.Lock()
 	d.cancel(err)
+	d.attMu.Unlock()
 	err = context.Cause(d.ctx)
 	// Cancel native delivery even if a user callback is currently blocked.
 	_ = d.conn.Close()

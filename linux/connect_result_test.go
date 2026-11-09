@@ -281,6 +281,7 @@ func TestConnectResultPublishedSuccessRetainsCancellationIntent(t *testing.T) {
 func TestConnectResultAbortNilDoesNotPublishSuccess(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h, d := newShutdownTestHCI(t, false)
+		h.adv = true // Keep setup pending on a real advertising restore command.
 		pd := &PlatData{Address: [6]byte{1}}
 		result := resultTestStart(t, h, d, pd, 0)
 		resultTestPhysical(d, pd)

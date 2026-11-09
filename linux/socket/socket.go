@@ -71,12 +71,24 @@ func (sa *SockaddrHCI) sockaddr() (unsafe.Pointer, _Socklen, error) {
 
 func Socket(domain, typ, proto int) (int, error) {
 	for i := 0; i < 5; i++ {
-		if fd, err := syscall.Socket(domain, typ, proto); err == nil || err != syscall.EBUSY {
+		if fd, err := openSocket(domain, typ, proto); err == nil || err != syscall.EBUSY {
 			return fd, err
 		}
 		time.Sleep(time.Second)
 	}
 	return 0, ErrSocketOpenFailed
+}
+
+// Old kernels and platforms without atomic socket flags must exclude fork
+// until the new descriptor has its close-on-exec flag.
+func socketCloseOnExec(domain, typ, proto int) (int, error) {
+	syscall.ForkLock.RLock()
+	fd, err := syscall.Socket(domain, typ, proto)
+	if err == nil {
+		syscall.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
+	return fd, err
 }
 
 func Bind(fd int, sa Sockaddr) (err error) {

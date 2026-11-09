@@ -168,9 +168,12 @@ func TestCCCDRejectsUnsupportedMode(t *testing.T) {
 	for _, property := range []Property{CharNotify, CharIndicate} {
 		t.Run(property.String(), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				c, chars, _ := newCCCDTestCentral(t, 1, &notificationTestConn{})
-				ch := chars[0]
+				s := NewService(UUID16(0xff00))
+				ch := s.AddCharacteristic(UUID16(0xff01))
+				ch.HandleNotifyFunc(func(Request, Notifier) {})
 				ch.props &^= property
+				c := newCentral(generateAttributes([]*Service{s}, 1), nil, &notificationTestConn{})
+				defer c.Close()
 				value := uint16(1)
 				if property == CharIndicate {
 					value = 2

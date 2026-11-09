@@ -309,6 +309,7 @@ func TestClientReaderWaitsForResponseProcessing(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				conn := newPeripheralTestConn()
 				p := newPeripheralForTest(conn)
+				p.responsePending = true // This test supplies the response owner.
 				rspc, processed := make(chan []byte), make(chan uint16)
 				done := make(chan struct{})
 				go func() { defer close(done); p.readLoop(rspc, processed, update.old) }()
@@ -345,6 +346,7 @@ func TestClientReaderResponseWaitsAreCancelable(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			conn := newPeripheralTestConn()
 			p := newPeripheralForTest(conn)
+			p.responsePending = true // Exercise an active response handoff.
 			rspc, processed := make(chan []byte), make(chan uint16)
 			done := make(chan struct{})
 			go func() { defer close(done); p.readLoop(rspc, processed, 23) }()

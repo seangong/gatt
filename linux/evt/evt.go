@@ -299,54 +299,38 @@ func (e *LEAdvertisingReportEP) Unmarshal(b []byte) error {
 	if len(b) < 2 {
 		return errors.New("invalid LE advertising report header")
 	}
-	e.SubeventCode = o.Uint8(b)
-	b = b[1:]
-	e.NumReports = o.Uint8(b)
-	b = b[1:]
-	n := int(e.NumReports)
+	n := int(b[1])
+	report := LEAdvertisingReportEP{SubeventCode: b[0], NumReports: b[1]}
+	b = b[2:]
 	// Each report needs event/address types, an address, data length and RSSI.
 	if len(b) < n*10 {
 		return errors.New("invalid LE advertising report length")
 	}
-	e.EventType = make([]uint8, n)
-	e.AddressType = make([]uint8, n)
-	e.Address = make([][6]byte, n)
-	e.Length = make([]uint8, n)
-	e.Data = make([][]byte, n)
-	e.RSSI = make([]int8, n)
+	report.EventType = make([]uint8, n)
+	report.AddressType = make([]uint8, n)
+	report.Address = make([][6]byte, n)
+	report.Length = make([]uint8, n)
+	report.Data = make([][]byte, n)
+	report.RSSI = make([]int8, n)
 
 	for i := 0; i < n; i++ {
-		e.EventType[i] = o.Uint8(b)
-		b = b[1:]
+		if len(b) < 10 {
+			return errors.New("invalid LE advertising report length")
+		}
+		report.EventType[i] = b[0]
+		report.AddressType[i] = b[1]
+		report.Address[i] = o.MAC(b[2:8])
+		report.Length[i] = b[8]
+		length := int(report.Length[i])
+		if len(b) < 10+length {
+			return errors.New("invalid LE advertising report data length")
+		}
+		report.Data[i] = make([]byte, length)
+		copy(report.Data[i], b[9:9+length])
+		report.RSSI[i] = o.Int8(b[9+length:])
+		b = b[10+length:]
 	}
-	for i := 0; i < n; i++ {
-		e.AddressType[i] = o.Uint8(b)
-		b = b[1:]
-	}
-	for i := 0; i < n; i++ {
-		e.Address[i] = o.MAC(b)
-		b = b[6:]
-	}
-	for i := 0; i < n; i++ {
-		e.Length[i] = o.Uint8(b)
-		b = b[1:]
-	}
-	dataLength := 0
-	for _, length := range e.Length {
-		dataLength += int(length)
-	}
-	if len(b) < dataLength+n {
-		return errors.New("invalid LE advertising report data length")
-	}
-	for i := 0; i < n; i++ {
-		e.Data[i] = make([]byte, e.Length[i])
-		copy(e.Data[i], b)
-		b = b[e.Length[i]:]
-	}
-	for i := 0; i < n; i++ {
-		e.RSSI[i] = o.Int8(b)
-		b = b[1:]
-	}
+	*e = report
 	return nil
 }
 

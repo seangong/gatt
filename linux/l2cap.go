@@ -258,6 +258,11 @@ func (c *conn) Close() error {
 		close(watchDone)
 	})
 	defer func() {
+		// Done can wake this caller before context cancellation dispatches the
+		// watchdog. Do not let stopWatch cancel the only shutdown request.
+		if err := ctx.Err(); err != nil {
+			c.hci.requestClose(fmt.Errorf("l2conn: close handle 0x%04X: %w", c.attr, err))
+		}
 		if !stopWatch() {
 			<-watchDone
 		}

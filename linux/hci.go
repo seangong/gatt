@@ -45,6 +45,7 @@ type HCI struct {
 
 	closeOnce       sync.Once
 	closeDone       chan struct{}
+	stopping        chan struct{}
 	abort           chan struct{}
 	changed         chan struct{}
 	readerDone      chan struct{}
@@ -59,8 +60,9 @@ type HCI struct {
 	scanning        bool
 	pending         *connectionAttempt // Protected by connsmu.
 
-	adv   bool
-	advmu *sync.Mutex
+	adv     bool
+	advmu   *sync.Mutex
+	advGate chan struct{} // Serialize advertising intent and complete configuration operations.
 }
 
 type bdaddr [6]byte
@@ -80,6 +82,7 @@ type PlatData struct {
 // All fields and channel publications are protected by HCI.connsmu.
 type connectionAttempt struct {
 	source        *PlatData
+	knownName     string // Immutable name accepted with the original Connect argument.
 	address       [6]byte
 	addressType   uint8
 	createDone    chan struct{}
@@ -96,7 +99,7 @@ type connectionAttempt struct {
 
 func newConnectionAttempt(pd *PlatData) *connectionAttempt {
 	return &connectionAttempt{
-		source: pd, address: pd.Address, addressType: pd.AddressType,
+		source: pd, knownName: pd.Name, address: pd.Address, addressType: pd.AddressType,
 		createDone: make(chan struct{}), done: make(chan struct{}), cancelDone: make(chan struct{}),
 		result: make(chan ConnectionResult, 1),
 	}
@@ -188,6 +191,8 @@ func (h *HCI) initLifecycle() {
 	}
 	if h.closeDone == nil {
 		h.closeDone = make(chan struct{})
+		h.stopping = make(chan struct{})
+		h.advGate = make(chan struct{}, 1)
 		h.abort = make(chan struct{})
 		h.changed = make(chan struct{}, 1)
 		h.readerDone = make(chan struct{})
@@ -220,7 +225,10 @@ func (h *HCI) requestClose(cause error) <-chan struct{} {
 		c.stop()
 	}
 	done := h.closeDone
-	h.closeOnce.Do(func() { go h.shutdown() })
+	h.closeOnce.Do(func() {
+		close(h.stopping)
+		go h.shutdown()
+	})
 	h.connsmu.Unlock()
 	return done
 }
@@ -399,13 +407,54 @@ func (h *HCI) callout(f func()) bool {
 }
 
 func (h *HCI) SetAdvertiseEnable(en bool) error {
+	if err := h.lockAdvertising(); err != nil {
+		return err
+	}
+	defer func() { <-h.advGate }()
 	h.advmu.Lock()
 	h.adv = en
 	h.advmu.Unlock()
-	return h.setAdvertiseEnable(en)
+	return h.setAdvertiseEnableLocked(en)
 }
 
+// lockAdvertising never holds a state mutex while waiting. Shutdown bypasses
+// this gate and wakes its waiters before starting controller cleanup.
+func (h *HCI) lockAdvertising() error {
+	h.connsmu.Lock()
+	h.initLifecycle()
+	closed, stopping, gate := h.closed, h.stopping, h.advGate
+	h.connsmu.Unlock()
+	if closed {
+		return io.ErrClosedPipe
+	}
+	select {
+	case <-stopping:
+		return io.ErrClosedPipe
+	case gate <- struct{}{}:
+	}
+	h.connsmu.Lock()
+	closed = h.closed
+	h.connsmu.Unlock()
+	if closed {
+		<-gate
+		return io.ErrClosedPipe
+	}
+	return nil
+}
+
+// Automatic restoration uses the current intent, not the state when the
+// connection event queued this operation.
 func (h *HCI) setAdvertiseEnable(en bool) error {
+	if err := h.lockAdvertising(); err != nil {
+		return err
+	}
+	defer func() { <-h.advGate }()
+	return h.setAdvertiseEnableLocked(en)
+}
+
+// setAdvertiseEnableLocked requires advGate, including when pausing advertising
+// for a configuration command. It does not change the requested advertising state.
+func (h *HCI) setAdvertiseEnableLocked(en bool) error {
 	h.connsmu.Lock()
 	closed, connectionCount := h.closed, len(h.conns)
 	h.connsmu.Unlock()
@@ -413,9 +462,9 @@ func (h *HCI) setAdvertiseEnable(en bool) error {
 		return io.ErrClosedPipe
 	}
 	h.advmu.Lock()
-	full := en && h.adv && connectionCount == h.maxConn
+	requested := h.adv
 	h.advmu.Unlock()
-	if full {
+	if en && (!requested || connectionCount == h.maxConn) {
 		return nil
 	}
 	if err := h.c.SendAndCheckResp(cmd.LESetAdvertiseEnable{AdvertisingEnable: btoi(en)}, []byte{0}); err != nil {
@@ -425,13 +474,17 @@ func (h *HCI) setAdvertiseEnable(en bool) error {
 }
 
 func (h *HCI) SendCmdWithAdvOff(cp cmd.CmdParam) error {
+	if err := h.lockAdvertising(); err != nil {
+		return err
+	}
+	defer func() { <-h.advGate }()
 	h.advmu.Lock()
 	advertising := h.adv
 	h.advmu.Unlock()
 	// Reset leaves advertising disabled. Only pause an active advertising
 	// configuration before updating it.
 	if advertising {
-		if err := h.setAdvertiseEnable(false); err != nil {
+		if err := h.setAdvertiseEnableLocked(false); err != nil {
 			return fmt.Errorf("disable advertising before command 0x%04x: %w", cp.Opcode(), err)
 		}
 	}
@@ -443,7 +496,7 @@ func (h *HCI) SendCmdWithAdvOff(cp cmd.CmdParam) error {
 	advertising = h.adv
 	h.advmu.Unlock()
 	if advertising {
-		if restoreErr := h.setAdvertiseEnable(true); restoreErr != nil {
+		if restoreErr := h.setAdvertiseEnableLocked(true); restoreErr != nil {
 			err = errors.Join(err, fmt.Errorf("restore advertising after command 0x%04x: %w", cp.Opcode(), restoreErr))
 		}
 	}
@@ -753,24 +806,55 @@ func (h *HCI) handlePacket(b []byte) {
 	}
 }
 
+type readLocalSupportedFeatures struct{}
+
+func (readLocalSupportedFeatures) Opcode() int    { return 0x1003 }
+func (readLocalSupportedFeatures) Len() int       { return 0 }
+func (readLocalSupportedFeatures) Marshal([]byte) {}
+
 func (h *HCI) resetDevice(ctx context.Context) error {
+	if err := h.c.SendAndCheckRespContext(ctx, cmd.Reset{}, []byte{0x00}); err != nil {
+		return err
+	}
+	features, err := h.c.SendContext(ctx, readLocalSupportedFeatures{})
+	if err != nil {
+		return fmt.Errorf("read controller features (0x1003): %w", err)
+	}
+	if len(features) == 0 || features[0] != 0 {
+		return fmt.Errorf("read controller features (0x1003): invalid response [% X]", features)
+	}
+	if len(features) != 9 {
+		return fmt.Errorf("read controller features (0x1003): response length %d, want 9", len(features))
+	}
+	// Feature bit 37 marks controllers without BR/EDR. Do not require the
+	// LE Supported bit here: LnxDeviceID explicitly allows bypassing that check
+	// for drivers which report it incorrectly.
+	brEdr := features[5]&0x20 == 0
 	seq := []cmd.CmdParam{
-		cmd.Reset{},
 		cmd.SetEventMask{EventMask: 0x3dbff807fffbffff},
 		cmd.LESetEventMask{LEEventMask: 0x000000000000001F},
-		cmd.WriteSimplePairingMode{SimplePairingMode: 1},
-		cmd.WriteLEHostSupported{LESupportedHost: 1, SimultaneousLEHost: 0},
-		cmd.WriteInquiryMode{InquiryMode: 2},
-		cmd.WritePageScanType{PageScanType: 1},
-		cmd.WriteInquiryScanType{ScanType: 1},
-		cmd.WriteClassOfDevice{ClassOfDevice: [3]byte{0x40, 0x02, 0x04}},
-		cmd.WritePageTimeout{PageTimeout: 0x2000},
-		cmd.WriteDefaultLinkPolicy{DefaultLinkPolicySettings: 0x5},
-		cmd.HostBufferSize{
-			HostACLDataPacketLength:            0x1000,
-			HostSynchronousDataPacketLength:    0xff,
-			HostTotalNumACLDataPackets:         0x0014,
-			HostTotalNumSynchronousDataPackets: 0x000a},
+	}
+	if brEdr {
+		// Preserve the existing dual-mode setup. LE-only controllers exclude
+		// these BR/EDR settings. HostBufferSize is not needed for LE-only setup:
+		// controller-to-host flow control is never enabled by this package.
+		seq = append(seq,
+			cmd.WriteSimplePairingMode{SimplePairingMode: 1},
+			cmd.WriteLEHostSupported{LESupportedHost: 1, SimultaneousLEHost: 0},
+			cmd.WriteInquiryMode{InquiryMode: 2},
+			cmd.WritePageScanType{PageScanType: 1},
+			cmd.WriteInquiryScanType{ScanType: 1},
+			cmd.WriteClassOfDevice{ClassOfDevice: [3]byte{0x40, 0x02, 0x04}},
+			cmd.WritePageTimeout{PageTimeout: 0x2000},
+			cmd.WriteDefaultLinkPolicy{DefaultLinkPolicySettings: 0x5},
+			cmd.HostBufferSize{
+				HostACLDataPacketLength:            0x1000,
+				HostSynchronousDataPacketLength:    0xff,
+				HostTotalNumACLDataPackets:         0x0014,
+				HostTotalNumSynchronousDataPackets: 0x000a},
+		)
+	}
+	seq = append(seq,
 		cmd.LESetScanParameters{
 			LEScanType:           0x01,   // [0x00]: passive, 0x01: active
 			LEScanInterval:       0x0010, // [0x10]: 0.625ms * 16
@@ -778,7 +862,7 @@ func (h *HCI) resetDevice(ctx context.Context) error {
 			OwnAddressType:       0x00,   // [0x00]: public, 0x01: random
 			ScanningFilterPolicy: 0x00,   // [0x00]: accept all, 0x01: ignore non-white-listed.
 		},
-	}
+	)
 	for _, s := range seq {
 		if err := h.c.SendAndCheckRespContext(ctx, s, []byte{0x00}); err != nil {
 			return err
@@ -990,6 +1074,9 @@ func (h *HCI) handleConnection(b []byte) {
 			pd.Conn = c
 		}
 		h.plistmu.Unlock()
+		if matches && pd.Name == "" {
+			pd.Name = a.knownName
+		}
 		if matches && a.withResult {
 			h.connsmu.Lock()
 			if c.attempt == a && !a.resultDone {
@@ -1115,6 +1202,9 @@ func (h *HCI) handleL2CAP(b []byte) error {
 	cid := binary.LittleEndian.Uint16(pdu[2:])
 	if cid == 5 {
 		return c.handleSignal(pdu)
+	}
+	if cid != 4 {
+		return nil
 	}
 	// Never block the HCI reader: transmit completion events share this loop.
 	select {
