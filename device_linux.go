@@ -17,6 +17,7 @@ type device struct {
 	deviceHandler
 
 	hci            *linux.HCI
+	hciDone        <-chan struct{}
 	state          State
 	closeHCI       func() error
 	mu             sync.Mutex
@@ -24,6 +25,7 @@ type device struct {
 	cancel         context.CancelFunc
 	initialized    bool
 	stopping       bool
+	explicitStop   bool // Fixed when shutdown starts; joining a fault must not cancel its results.
 	stopDone       chan struct{}
 	stopErr        error
 	workers        sync.WaitGroup
@@ -82,9 +84,18 @@ func NewDevice(opts ...Option) (Device, error) {
 	}
 
 	d.hci = h
+	d.hciDone = h.Done()
 	d.closeHCI = h.Close
 	d.initLifecycleLocked()
+	go d.watchHCI()
 	return d, nil
+}
+
+// This observer must stay outside workers: Stop waits for those workers while
+// this goroutine itself waits for the shared shutdown to finish.
+func (d *device) watchHCI() {
+	<-d.hciDone
+	_ = d.stopContext(context.Background(), false)
 }
 
 func (d *device) initLifecycleLocked() {
@@ -105,6 +116,12 @@ func (d *device) Init(f func(Device, State)) error {
 		d.mu.Unlock()
 		return io.ErrClosedPipe
 	}
+	select {
+	case <-d.hciDone:
+		d.mu.Unlock()
+		return io.ErrClosedPipe
+	default:
+	}
 	if d.initialized {
 		d.mu.Unlock()
 		return errors.New("device already initialized")
@@ -121,10 +138,11 @@ func (d *device) Init(f func(Device, State)) error {
 		c := newCentral(attrs, net.HardwareAddr(a[:]), pd.Conn)
 		c.requestSlots, c.callbackSlots = d.requestSlots, d.callbackSlots
 		stopCancel := context.AfterFunc(d.ctx, c.cancel)
-		d.runConnection(c.Context(), true, func() {
+		d.runConnection(c.Context(), true, func() bool {
 			if d.centralConnected != nil {
 				d.centralConnected(c)
 			}
+			return true
 		}, c.loop, func() {
 			if d.centralDisconnected != nil {
 				d.centralDisconnected(c)
@@ -172,10 +190,13 @@ func (d *device) startCallback(f func()) bool {
 
 // runConnection separates cancelable protocol work from ordered application
 // callbacks. A stuck callback retains its lifecycle slot after disconnection.
-func (d *device) runConnection(ctx context.Context, waitConnected bool, connected, run, disconnected func(), closeConn func() error, failed func(error)) {
+func (d *device) runConnection(ctx context.Context, waitConnected bool, connected func() bool, run, disconnected func(), closeConn func() error, failed func(error)) {
 	d.mu.Lock()
 	if d.stopping {
 		d.mu.Unlock()
+		if failed != nil {
+			failed(io.ErrClosedPipe)
+		}
 		return
 	}
 	select {
@@ -215,6 +236,9 @@ func (d *device) runConnection(ctx context.Context, waitConnected bool, connecte
 	go func() {
 		defer func() { <-d.lifecycleSlots }()
 		if d.ctx.Err() != nil {
+			if failed != nil {
+				failed(io.ErrClosedPipe)
+			}
 			return
 		}
 		if ctx.Err() != nil {
@@ -223,7 +247,12 @@ func (d *device) runConnection(ctx context.Context, waitConnected bool, connecte
 			}
 			return
 		}
-		connected()
+		if !connected() {
+			if failed != nil {
+				failed(io.ErrClosedPipe)
+			}
+			return
+		}
 		close(ready)
 		<-coreDone
 		d.mu.Lock()
@@ -246,9 +275,21 @@ func (d *device) Stop() error {
 // ctx cancellation. Canceling ctx only stops this caller's wait; the shared
 // shutdown continues until its resources and protocol workers are released.
 func (d *device) StopContext(ctx context.Context) error {
+	return d.stopContext(ctx, true)
+}
+
+func (d *device) stopContext(ctx context.Context, explicit bool) error {
 	d.mu.Lock()
 	d.initLifecycleLocked()
 	if !d.stopping {
+		select {
+		case <-d.hciDone:
+			// HCI has already published any pending fault result, even if its
+			// observer has not run yet. A joining Stop must preserve that result.
+			explicit = false
+		default:
+		}
+		d.explicitStop = explicit
 		d.stopping = true
 		d.state = StatePoweredOff
 		d.cancel()
@@ -463,6 +504,20 @@ func (d *device) StopScanning() {
 }
 
 func (d *device) Connect(p Peripheral) {
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		return
+	}
+	select {
+	case <-d.hciDone:
+		d.mu.Unlock()
+		return
+	default:
+	}
+	d.mu.Unlock()
+	// Admission belongs to this call, before the synchronous command submission.
+	// Its result must survive an HCI failure while that submission is waiting.
 	d.connectionResult(p, d.hci.ConnectWithResult(p.(*peripheral).pd))
 }
 
@@ -481,6 +536,13 @@ func (d *device) connectionResult(source Peripheral, result <-chan linux.Connect
 		go func() {
 			select {
 			case <-d.ctx.Done():
+				// HCI publishes its one result before signaling termination. Drain
+				// that result without keeping explicit-stop waiters alive.
+				select {
+				case outcome := <-result:
+					consume(outcome)
+				default:
+				}
 			case outcome := <-result:
 				consume(outcome)
 			}
@@ -493,7 +555,34 @@ func (d *device) connectionFailure(source Peripheral, err error) {
 		return
 	}
 	d.mu.Lock()
-	if d.stopping || d.peripheralConnected == nil {
+	waitForStop := d.stopping && !d.explicitStop
+	if !d.stopping {
+		select {
+		case <-d.hciDone:
+			waitForStop = true
+		default:
+		}
+	}
+	d.mu.Unlock()
+	if waitForStop {
+		// Never wait here: failed can run before its protocol cleanup worker
+		// starts, and Stop itself waits for that worker. HCI may have signaled
+		// termination before its observer has had a chance to start Stop.
+		go func() {
+			_ = d.stopContext(context.Background(), false)
+			if (errors.Is(err, io.ErrClosedPipe) || errors.Is(err, io.EOF)) && d.stopErr != nil {
+				err = d.stopErr
+			}
+			d.deliverConnectionFailure(source, err)
+		}()
+		return
+	}
+	d.deliverConnectionFailure(source, err)
+}
+
+func (d *device) deliverConnectionFailure(source Peripheral, err error) {
+	d.mu.Lock()
+	if d.stopping && d.explicitStop || d.peripheralConnected == nil {
 		d.mu.Unlock()
 		return
 	}
@@ -535,10 +624,18 @@ func (d *device) acceptPeripheral(pd *linux.PlatData, source Peripheral) {
 		}
 		d.connectionFailure(source, err)
 	}
-	d.runConnection(ctx, false, func() {
-		if d.peripheralConnected != nil {
-			d.peripheralConnected(p, nil)
+	d.runConnection(ctx, false, func() bool {
+		d.mu.Lock()
+		if d.stopping {
+			d.mu.Unlock()
+			return false
 		}
+		f := d.peripheralConnected
+		d.mu.Unlock()
+		if f != nil {
+			f(p, nil)
+		}
+		return true
 	}, p.loop, func() {
 		if d.peripheralDisconnected != nil {
 			d.peripheralDisconnected(p, nil)

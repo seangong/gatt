@@ -341,27 +341,31 @@ func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descr
 }
 
 func (p *peripheral) ReadCharacteristic(c *Characteristic) ([]byte, error) {
-	result := p.readCharacteristic(c)
+	result := p.readHandle(c.vh)
 	if result.err != nil {
 		return nil, result.err
 	}
 	return result.b[1:], nil
 }
 
-func (p *peripheral) readCharacteristic(c *Characteristic) peripheralResult {
+func (p *peripheral) readHandle(h uint16) peripheralResult {
 	b := make([]byte, 3)
 	op := byte(attOpReadReq)
 	b[0] = op
-	binary.LittleEndian.PutUint16(b[1:3], c.vh)
+	binary.LittleEndian.PutUint16(b[1:3], h)
 	return p.send(op, b, false)
 }
 
 func (p *peripheral) ReadLongCharacteristic(c *Characteristic) ([]byte, error) {
+	return p.readLong(c.vh, false)
+}
+
+func (p *peripheral) readLong(h uint16, descriptor bool) ([]byte, error) {
 	// The spec says that a read blob request should fail if the characteristic
 	// is smaller than mtu - 1.  To simplify the API, the first read is done
 	// with a regular read request.  If the buffer received is equal to mtu -1,
 	// then we read the rest of the data using read blob.
-	first := p.readCharacteristic(c)
+	first := p.readHandle(h)
 	if first.err != nil {
 		return nil, first.err
 	}
@@ -381,16 +385,22 @@ func (p *peripheral) ReadLongCharacteristic(c *Characteristic) ([]byte, error) {
 		b := make([]byte, 5)
 		op := byte(attOpReadBlobReq)
 		b[0] = op
-		binary.LittleEndian.PutUint16(b[1:3], c.vh)
+		binary.LittleEndian.PutUint16(b[1:3], h)
 		binary.LittleEndian.PutUint16(b[3:5], uint16(off))
 
 		result := p.send(op, b, false)
 		if result.err != nil {
+			// GATT descriptor long reads may end with Invalid Offset at the
+			// next unread offset. Characteristic reads retain their error contract.
+			if descriptor && errors.Is(result.err, attEcodeInvalidOffset) && len(result.b) == 5 &&
+				result.b[0] == attOpError && result.b[1] == attOpReadBlobReq && binary.LittleEndian.Uint16(result.b[2:4]) == h {
+				return buf.Bytes(), nil
+			}
 			// A fixed value that exactly filled the first response may reject
 			// the first blob. An intervening MTU change cannot prove completeness.
 			if firstBlob && result.mtu == first.mtu && len(firstRead) == int(first.mtu)-1 &&
 				errors.Is(result.err, attEcodeAttrNotLong) && len(result.b) == 5 &&
-				result.b[1] == attOpReadBlobReq && binary.LittleEndian.Uint16(result.b[2:4]) == c.vh {
+				result.b[1] == attOpReadBlobReq && binary.LittleEndian.Uint16(result.b[2:4]) == h {
 				return firstRead, nil
 			}
 			return nil, result.err
@@ -427,17 +437,7 @@ func (p *peripheral) WriteCharacteristic(c *Characteristic, value []byte, noRsp 
 }
 
 func (p *peripheral) ReadDescriptor(d *Descriptor) ([]byte, error) {
-	b := make([]byte, 3)
-	op := byte(attOpReadReq)
-	b[0] = op
-	binary.LittleEndian.PutUint16(b[1:3], d.h)
-
-	b, err := p.sendReq(op, b)
-	if err != nil {
-		return nil, err
-	}
-	b = b[1:]
-	return b, nil
+	return p.readLong(d.h, true)
 }
 
 func (p *peripheral) WriteDescriptor(d *Descriptor, value []byte) error {

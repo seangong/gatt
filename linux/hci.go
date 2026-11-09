@@ -1,6 +1,7 @@
 package linux
 
 import (
+	"container/list"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -29,8 +30,9 @@ type HCI struct {
 	c *cmd.Cmd
 	e *evt.Evt
 
-	plist   map[peerAddress]*advertisementEntry
-	plistmu *sync.Mutex
+	plist    map[peerAddress]*advertisementEntry
+	plistmu  *sync.Mutex
+	plistLRU list.List // Protected by plistmu.
 
 	bufCnt  chan struct{}
 	bufSize int
@@ -76,6 +78,7 @@ type advertisementEntry struct {
 	data             PlatData
 	advertisingData  []byte
 	hasAdvertisement bool
+	element          *list.Element
 }
 
 type PlatData struct {
@@ -93,7 +96,8 @@ type PlatData struct {
 // All fields and channel publications are protected by HCI.connsmu.
 type connectionAttempt struct {
 	source        *PlatData
-	knownName     string // Immutable name accepted with the original Connect argument.
+	report        PlatData // Owned Connect metadata, retained even if the scan cache evicts this peer.
+	knownName     string   // Immutable name accepted with the original Connect argument.
 	address       [6]byte
 	addressType   uint8
 	createDone    chan struct{}
@@ -109,8 +113,10 @@ type connectionAttempt struct {
 }
 
 func newConnectionAttempt(pd *PlatData) *connectionAttempt {
+	report := *pd
+	report.Data = append([]byte(nil), pd.Data...)
 	return &connectionAttempt{
-		source: pd, knownName: pd.Name, address: pd.Address, addressType: pd.AddressType,
+		source: pd, report: report, knownName: pd.Name, address: pd.Address, addressType: pd.AddressType,
 		createDone: make(chan struct{}), done: make(chan struct{}), cancelDone: make(chan struct{}),
 		result: make(chan ConnectionResult, 1),
 	}
@@ -267,6 +273,16 @@ func (h *HCI) Close() error {
 	return h.closeErr
 }
 
+// Done is closed when HCI shutdown starts, including after a controller or
+// transport failure. It does not signal that resources have been released;
+// Close waits for shutdown to finish and returns its result.
+func (h *HCI) Done() <-chan struct{} {
+	h.connsmu.Lock()
+	defer h.connsmu.Unlock()
+	h.initLifecycle()
+	return h.stopping
+}
+
 func (h *HCI) shutdown() {
 	ctx, cancel := context.WithTimeout(context.Background(), hciGraceTimeout)
 	defer cancel()
@@ -307,6 +323,12 @@ func (h *HCI) shutdown() {
 	h.workers.Wait()
 	if started {
 		<-readerDone
+	}
+	if h.plistmu != nil {
+		h.plistmu.Lock()
+		h.plist = make(map[peerAddress]*advertisementEntry)
+		h.plistLRU.Init()
+		h.plistmu.Unlock()
 	}
 	h.connsmu.Lock()
 	cause := h.closeCause
@@ -563,33 +585,34 @@ func (h *HCI) connect(pd *PlatData, withResult bool) (*connectionAttempt, error)
 	a := newConnectionAttempt(pd)
 	a.withResult = withResult
 	h.pending = a
+	h.initLifecycle()
 	h.connsmu.Unlock()
 	// Keep the caller's parsed name without sharing mutable advertisement data.
-	report := *pd
-	report.Data = append([]byte(nil), pd.Data...)
+	report := a.report
+	report.Data = append([]byte(nil), a.report.Data...)
 	h.plistmu.Lock()
-	key := peerAddress{pd.Address, pd.AddressType}
-	entry := h.plist[key]
-	if entry == nil {
-		entry = &advertisementEntry{}
-		h.plist[key] = entry
+	select {
+	case <-h.stopping:
+		// A close may finish before this admitted sender reaches the cache.
+	default:
+		key := peerAddress{a.address, a.addressType}
+		h.advertisementLocked(key, true).data = report
 	}
-	entry.data = report
 	h.plistmu.Unlock()
 	_, err := h.c.Send(
 		cmd.LECreateConn{
-			LEScanInterval:        0x0004,         // N x 0.625ms
-			LEScanWindow:          0x0004,         // N x 0.625ms
-			InitiatorFilterPolicy: 0x00,           // white list not used
-			PeerAddressType:       pd.AddressType, // public or random
-			PeerAddress:           pd.Address,     //
-			OwnAddressType:        0x00,           // public
-			ConnIntervalMin:       0x0006,         // N x 0.125ms
-			ConnIntervalMax:       0x0006,         // N x 0.125ms
-			ConnLatency:           0x0000,         //
-			SupervisionTimeout:    0x000A,         // N x 10ms
-			MinimumCELength:       0x0000,         // N x 0.625ms
-			MaximumCELength:       0x0000,         // N x 0.625ms
+			LEScanInterval:        0x0004,        // N x 0.625ms
+			LEScanWindow:          0x0004,        // N x 0.625ms
+			InitiatorFilterPolicy: 0x00,          // white list not used
+			PeerAddressType:       a.addressType, // public or random
+			PeerAddress:           a.address,     //
+			OwnAddressType:        0x00,          // public
+			ConnIntervalMin:       0x0006,        // N x 0.125ms
+			ConnIntervalMax:       0x0006,        // N x 0.125ms
+			ConnLatency:           0x0000,        //
+			SupervisionTimeout:    0x000A,        // N x 10ms
+			MinimumCELength:       0x0000,        // N x 0.625ms
+			MaximumCELength:       0x0000,        // N x 0.625ms
 		})
 	var abortConn *conn
 	h.connsmu.Lock()
@@ -941,7 +964,7 @@ func (h *HCI) handleAdvertisement(b []byte) {
 
 		if et == scanRsp {
 			h.plistmu.Lock()
-			entry := h.plist[addr]
+			entry := h.advertisementLocked(addr, false)
 			var report PlatData
 			found := entry != nil && entry.hasAdvertisement
 			if found {
@@ -966,9 +989,8 @@ func (h *HCI) handleAdvertisement(b []byte) {
 			RSSI:        ep.RSSI[i],
 		}
 		h.plistmu.Lock()
-		h.plist[addr] = &advertisementEntry{
-			data: *pd, advertisingData: data, hasAdvertisement: true,
-		}
+		entry := h.advertisementLocked(addr, true)
+		entry.data, entry.advertisingData, entry.hasAdvertisement = *pd, data, true
 		h.plistmu.Unlock()
 		if scannable {
 			continue
@@ -1111,8 +1133,13 @@ func (h *HCI) handleConnection(b []byte) {
 			}
 			return
 		}
+		if matches {
+			*pd = a.report
+			pd.Data = append([]byte(nil), a.report.Data...)
+			pd.Conn = c
+		}
 		h.plistmu.Lock()
-		if advertised := h.plist[peerAddress{ep.PeerAddress, ep.PeerAddressType}]; advertised != nil {
+		if advertised := h.advertisementLocked(peerAddress{ep.PeerAddress, ep.PeerAddressType}, false); advertised != nil {
 			*pd = advertised.data
 			pd.Data = append([]byte(nil), advertised.data.Data...)
 			pd.Conn = c

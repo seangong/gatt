@@ -2,6 +2,7 @@ package linux
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -315,10 +316,13 @@ func (c *conn) disconnect(ctx context.Context) error {
 	c.stop()
 	h.connsmu.Unlock()
 
-	cp := cmd.Disconnect{ConnectionHandle: c.attr, Reason: 0x13}
+	cp := &boundDisconnect{Disconnect: cmd.Disconnect{ConnectionHandle: c.attr, Reason: 0x13}, owner: c}
 	// Disconnect is cleanup even before HCI shutdown begins. Keep a queued
 	// request admissible when BeginShutdown rejects ordinary commands.
 	_, err := h.c.SendShutdownContext(ctx, cp)
+	if errors.Is(err, errRetiredDisconnect) {
+		err = nil
+	}
 	if err != nil {
 		c.disconnectErr = fmt.Errorf("l2conn: failed to disconnect: %w", err)
 	}

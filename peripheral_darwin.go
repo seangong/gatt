@@ -41,6 +41,9 @@ type peripheral struct {
 	ctx      context.Context
 	cancel   context.CancelCauseFunc
 	requests xpcRequests
+
+	callbackOnce sync.Once
+	callbacks    *darwinCallbacks
 }
 
 func NewPeripheral(u UUID) Peripheral { return &peripheral{id: xpc.UUID(u.b)} }
@@ -553,7 +556,7 @@ func (p *peripheral) handleResponse(id int, args xpc.Dict) {
 		ch := uint16(args.MustGetInt("kCBMsgArgCharacteristicHandle"))
 		b := args.MustGetBytes("kCBMsgArgData")
 		if f := p.sub.fn(ch); f != nil {
-			go f(b, nil)
+			p.queueNotification(func() { f(b, nil) })
 		}
 		return
 	}

@@ -48,6 +48,13 @@ Current limitations include:
   native batches. Batches with multiple writes and writes with a nonzero offset
   are rejected before any business handler executes. This also rejects batches
   of multiple writes without response that older code might have processed.
+- **macOS server descriptors:** static descriptor values are supported; dynamic
+  descriptor read or write handlers are rejected with `errors.ErrUnsupported`.
+  The legacy backend has no verified registration path for those callbacks.
+- **macOS server notifications:** notifications are not targeted to one central.
+  The legacy backend sends an empty target list, described by its original
+  implementation as broadcasting to all subscribed centrals. Do not assume
+  per-central notification isolation; native behavior requires hardware testing.
 
 The presence of an API, or a placeholder returning `nil`, is not evidence that
 an operation is implemented. See the
@@ -210,6 +217,24 @@ for its disconnection callback before reconnecting to the same device; other
 connections remain usable.
 Failed subscription changes preserve the previous callback.
 
+On macOS, Connected and Disconnected callbacks run in order for each connected
+owner. Notifications use a separate FIFO, so Connected can subscribe and wait
+for a notification, and a notification callback can cancel and wait for
+Disconnected. Native request responses stay outside both callback queues;
+synchronous discovery, reads and subscription changes remain usable inside
+callbacks. Different connections and reconnect generations are independent.
+
+Termination discards notification callbacks that have not started. A callback
+already running may finish after disconnection or Close. At most 16 notifications
+may wait for one owner; overflowing that queue cancels that owner and reports
+one Disconnected callback with the queue error. Client connection callback groups
+are limited to 16 per device, with at most two workers per connected group.
+Pending/rejected Connect error callbacks use the same group allowance. A group
+remains occupied until its handlers actually return; exhaustion terminates the
+device session and is observable through Done/Err. These are library resource
+bounds, not controller capacity limits; they do not cover scan, state or server
+notification handlers. Close does not wait for application handlers.
+
 Repeated macOS `Connect` calls for the same UUID still send the native connection
 command, but preserve the current pending or connected session and its requests,
 cache and subscriptions. Duplicate success events do not publish another session
@@ -222,6 +247,13 @@ removal. `SetServices` applies services in order; if an add fails, services
 already added by that call remain. An add failure releases only its own local
 registrations. Notification handlers should observe `Notifier.Done()` when a
 subscription or service is removed.
+
+`AddService` rejects unsupported dynamic descriptors before sending native
+commands or allocating local attribute IDs. `SetServices` checks the entire
+replacement list for this local error before removing existing services. This
+preflight does not make native service replacement atomic; native add failures
+retain the ordered, partial-success behavior described above. Automatic CCCDs
+and static descriptors retain their existing registration paths.
 
 ## Minimal Linux server
 
@@ -274,6 +306,10 @@ func run() (err error) {
 	service.AddCharacteristic(valueUUID).SetValue([]byte("ready"))
 	setup := make(chan error, 1)
 	if err := d.Init(func(device gatt.Device, state gatt.State) {
+		if state == gatt.StatePoweredOff {
+			stopSignals()
+			return
+		}
 		if state != gatt.StatePoweredOn {
 			return
 		}
@@ -351,6 +387,18 @@ payload. A new advertising report starts a new pair. Scan and connection
 callbacks receive independent data snapshots. Public MAC ID formatting is
 unchanged.
 
+The Linux scan cache holds at most 4096 addresses and evicts the least recently
+used entry when full. Stopping scanning keeps this bounded cache; final shutdown
+releases it. A pending connection retains an independent copy of its original
+report, so cache eviction does not lose its original metadata or cancellation
+identity. An orphan scan response for an evicted address must wait for a new
+advertising report before it can be combined.
+
+For scannable advertising, the current Linux discovery callback waits for the
+scan response. Receiving only the advertising report does not produce a
+discovery callback, including when the peer does not answer the scan request.
+This existing callback timing is unchanged.
+
 Service UUID lists, solicitation lists and Service Data support 16-, 32- and
 128-bit UUIDs on the wire. Linux expands 32-bit UUIDs to their Bluetooth-base
 128-bit form, so their strings can be parsed by the existing `ParseUUID` API.
@@ -398,6 +446,12 @@ Linux client connections also start at MTU 23; an explicit `SetMTU` call is not
 required before `ReadLongCharacteristic`. A successful MTU exchange takes
 effect before the next ATT request, and each read uses its transaction's MTU
 when determining whether more data remains.
+`ReadDescriptor` also continues with Read Blob requests when its first response
+fills the transaction's MTU. It returns the complete value or an error rather
+than silently returning the first fragment. A matching Invalid Offset response
+terminates descriptor continuation; characteristic long-read error handling is
+unchanged. Long reads are a sequence of ATT transactions, not an atomic snapshot
+of a value that the remote application changes during the read.
 Read `Notifier.Cap()` after negotiation rather than assuming a fixed size.
 Oversized writes return `0, io.ErrShortWrite` without sending a value. The library
 does not split a value into multiple ATT notifications.
@@ -484,11 +538,31 @@ fault shutdown path, releasing pending commands and connections. `Close`
 reports the controller's hardware code. Recovery requires reopening the device;
 this event does not trigger an automatic reset or replay of commands.
 
+Asynchronous HCI termination also starts the device's shared shutdown, cancels
+protocol work, and delivers `StatePoweredOff` after the existing core cleanup.
+`Stop` or `StopContext` returns the original HCI failure once cleanup completes.
+`Init` rejects an HCI session already terminating. Low-level `linux.HCI.Done()`
+signals the start of shutdown; it does not mean resources have been released.
+Use `Close` to wait for low-level cleanup. The portable `Device` interface is
+unchanged.
+
 Linux HCI commands remain serialized and also respect the controller's reported
 command allowance. Sending waits while that allowance is zero. Shutdown rejects
 unsent ordinary commands while keeping cleanup commands admissible; cleanup
 still needs controller allowance and uses the shared shutdown deadline. If the
 controller never grants it, shutdown follows the existing forced-close path.
+
+Library-generated Disconnect commands retain their connection identity while
+waiting for the command slot, controller allowance or socket writability. A
+retired connection's unsent cleanup is canceled before submission, so a reused
+handle does not target its replacement. Once fully submitted, Disconnect still
+waits for its own command response even if physical disconnection arrives first.
+
+A complete command write accompanied by an error returns the original error
+without refunding its allowance, and retires the command processor. This prevents
+a late response from completing a later command with the same opcode. Zero-byte
+and partial failed writes retain their existing refund and continued-send
+behavior; commands are not automatically retried.
 
 - `StopContext` rejects new operations, cancels connection IO and starts one
   shared shutdown. Concurrent callers wait for the same cleanup and result.
@@ -522,6 +596,14 @@ For Linux outgoing connections, command rejection, connection failure and setup
 failure are reported through `PeripheralConnected` with the original request
 object and a non-nil error. That object does not represent a usable connection.
 Explicit cancellation and normal shutdown suppress pending connection callbacks.
+An admitted Connect's non-cancellation failure survives fault-driven device
+shutdown, preserving the original request identity and error. An unreported
+success interrupted by that fault reports failure rather than Disconnected.
+Fault callbacks may start after core cleanup and can reenter Stop to retrieve
+the same shutdown result. Joining a fault shutdown, including from PoweredOff,
+does not turn it into an explicit cancellation; an explicit Stop that initiates
+shutdown retains its callback-suppression behavior. Calls made after shutdown
+starts are not admitted as new connection attempts.
 Low-level HCI callers can use `ConnectWithResult` to receive one buffered result;
 the existing HCI `Connect` return value and success handler remain unchanged.
 Successful outgoing connections retain the name known when the attempt began

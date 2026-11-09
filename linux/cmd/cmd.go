@@ -19,6 +19,17 @@ type CmdParam interface {
 	Len() int
 }
 
+// Scoped commands may retire while waiting for their first transport attempt.
+// These optional methods are consumed here and implemented by private types in
+// the parent linux package; ordinary command parameters keep the Write path.
+type unsentCancellation interface {
+	UnsentCancellation() (<-chan struct{}, error)
+}
+
+type commandWriter interface {
+	WriteCommand(io.Writer, []byte) (int, error)
+}
+
 func NewCmd(d io.Writer) *Cmd {
 	c := &Cmd{
 		dev:           d,
@@ -136,7 +147,9 @@ func (c *Cmd) Send(cp CmdParam) ([]byte, error) {
 // SendContext waits for the serial command slot, controller credit and response
 // until ctx is canceled or the command processor is closed. Canceling after a command
 // is written closes the processor: a late response must not match a later
-// command with the same opcode. It cannot interrupt the device's Write.
+// command with the same opcode. A full write accompanied by an error also
+// closes the processor and returns the original error. It cannot interrupt the
+// device's Write.
 func (c *Cmd) SendContext(ctx context.Context, cp CmdParam) ([]byte, error) {
 	return c.sendContext(ctx, cp, false)
 }
@@ -156,11 +169,18 @@ func (c *Cmd) sendContext(ctx context.Context, cp CmdParam, shutdown bool) ([]by
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var retired <-chan struct{}
+	var retiredErr error
+	if scoped, ok := cp.(unsentCancellation); ok {
+		retired, retiredErr = scoped.UnsentCancellation()
+	}
 	select {
 	case <-c.done:
 		return nil, io.ErrClosedPipe
 	case <-stopping:
 		return nil, io.ErrClosedPipe
+	case <-retired:
+		return nil, retiredErr
 	default:
 	}
 	select {
@@ -170,6 +190,8 @@ func (c *Cmd) sendContext(ctx context.Context, cp CmdParam, shutdown bool) ([]by
 		return nil, io.ErrClosedPipe
 	case <-stopping:
 		return nil, io.ErrClosedPipe
+	case <-retired:
+		return nil, retiredErr
 	case c.sendGate <- struct{}{}:
 	}
 	defer func() { <-c.sendGate }()
@@ -177,7 +199,7 @@ func (c *Cmd) sendContext(ctx context.Context, cp CmdParam, shutdown bool) ([]by
 	op := cp.Opcode()
 	p := &cmdPkt{op: op, cp: cp, done: make(chan cmdResult, 1)}
 	raw := p.Marshal()
-	epoch, err := c.takeCredit(ctx, stopping)
+	epoch, err := c.takeCredit(ctx, stopping, retired, retiredErr)
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +217,8 @@ func (c *Cmd) sendContext(ctx context.Context, cp CmdParam, shutdown bool) ([]by
 		return nil, io.ErrClosedPipe
 	case <-stopping:
 		return nil, io.ErrClosedPipe
+	case <-retired:
+		return nil, retiredErr
 	default:
 	}
 
@@ -211,13 +235,23 @@ func (c *Cmd) sendContext(ctx context.Context, cp CmdParam, shutdown bool) ([]by
 			}
 		}
 	}()
-	n, err := c.dev.Write(raw)
+	var n int
+	if scoped, ok := cp.(commandWriter); ok {
+		n, err = scoped.WriteCommand(c.dev, raw)
+	} else {
+		n, err = c.dev.Write(raw)
+	}
 	if n == len(raw) {
 		// A Writer may report a complete packet together with an error. That
 		// packet has consumed its credit even though the caller gets the error.
 		refund = false
 	}
 	if err != nil {
+		if !refund {
+			// The submitted command can still produce a response. Retire the
+			// processor before another command can reuse its opcode.
+			c.Close()
+		}
 		return nil, err
 	}
 	if n != len(raw) {
@@ -237,7 +271,7 @@ func (c *Cmd) sendContext(ctx context.Context, cp CmdParam, shutdown bool) ([]by
 	}
 }
 
-func (c *Cmd) takeCredit(ctx context.Context, stopping <-chan struct{}) (uint64, error) {
+func (c *Cmd) takeCredit(ctx context.Context, stopping, retired <-chan struct{}, retiredErr error) (uint64, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return 0, err
@@ -247,6 +281,8 @@ func (c *Cmd) takeCredit(ctx context.Context, stopping <-chan struct{}) (uint64,
 			return 0, io.ErrClosedPipe
 		case <-stopping:
 			return 0, io.ErrClosedPipe
+		case <-retired:
+			return 0, retiredErr
 		default:
 		}
 		c.sentMu.Lock()
@@ -264,6 +300,8 @@ func (c *Cmd) takeCredit(ctx context.Context, stopping <-chan struct{}) (uint64,
 			return 0, io.ErrClosedPipe
 		case <-stopping:
 			return 0, io.ErrClosedPipe
+		case <-retired:
+			return 0, retiredErr
 		case <-c.creditChanged:
 		}
 	}

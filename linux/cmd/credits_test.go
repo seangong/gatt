@@ -280,7 +280,7 @@ func TestFailedWriteRefundPreservesNewAbsoluteCredits(t *testing.T) {
 	}
 }
 
-func TestFullWriteWithErrorDoesNotRefundCredit(t *testing.T) {
+func TestFullWriteWithErrorRetiresProcessorWithoutRefund(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		writes := make(chan []byte, 2)
 		want := errors.New("full command write reported an error")
@@ -301,13 +301,17 @@ func TestFullWriteWithErrorDoesNotRefundCredit(t *testing.T) {
 		if len(writes) != 0 {
 			t.Fatal("full write with error incorrectly refunded its credit")
 		}
-		creditTestEvent(t, c, true, 1, 0, 0)
-		if raw := <-writes; raw[4] != 2 {
-			t.Fatalf("next command = %x, want value 2", raw)
+		if err := creditTestResult(t, result); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("command after a full write error = %v, want closed pipe", err)
 		}
-		creditTestEvent(t, c, false, 1, testCommandOpcode, 2)
-		if err := creditTestResult(t, result); err != nil {
-			t.Fatal(err)
+		c.sentMu.Lock()
+		credits := c.credits
+		c.sentMu.Unlock()
+		if credits != 0 {
+			t.Fatalf("complete command refunded credit: %d", credits)
+		}
+		if err := c.HandleStatus([]byte{0, 1, 0, 0}); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("credit event after full write error = %v, want closed pipe", err)
 		}
 	})
 }

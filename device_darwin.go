@@ -44,6 +44,9 @@ type device struct {
 	requests xpcRequests
 	stateMu  sync.Mutex
 
+	callbackOnce  sync.Once
+	callbackSlots chan struct{}
+
 	// Only used in client/centralManager implementation
 	plist   map[string]*peripheral
 	plistmu *sync.Mutex
@@ -229,6 +232,19 @@ func (d *device) stopServiceNotifiersLocked(removed map[int]*attr) {
 	}
 }
 
+// Native descriptor registration only supports static values; it does not
+// assign descriptor IDs that could route application read or write handlers.
+func validateServiceDescriptors(s *Service) error {
+	for _, c := range s.Characteristics() {
+		for _, descriptor := range c.Descriptors() {
+			if descriptor.rhandler != nil || descriptor.whandler != nil {
+				return fmt.Errorf("dynamic macOS descriptor %s: %w", descriptor.uuid, errors.ErrUnsupported)
+			}
+		}
+	}
+	return nil
+}
+
 func (d *device) AddService(s *Service) error {
 	if err := context.Cause(d.ctx); err != nil {
 		return err
@@ -236,6 +252,9 @@ func (d *device) AddService(s *Service) error {
 	if s.uuid.Equal(attrGAPUUID) || s.uuid.Equal(attrGATTUUID) {
 		// skip GATT and GAP services
 		return nil
+	}
+	if err := validateServiceDescriptors(s); err != nil {
+		return fmt.Errorf("add service: %w", err)
 	}
 
 	var added map[int]*attr
@@ -365,6 +384,19 @@ func (d *device) AddService(s *Service) error {
 }
 
 func (d *device) SetServices(ss []*Service) error {
+	if err := context.Cause(d.ctx); err != nil {
+		return err
+	}
+	// Reject unsupported local configuration before retiring any live service.
+	// Native failures below retain the existing partial-application behavior.
+	for _, s := range ss {
+		if s.uuid.Equal(attrGAPUUID) || s.uuid.Equal(attrGATTUUID) {
+			continue
+		}
+		if err := validateServiceDescriptors(s); err != nil {
+			return fmt.Errorf("set services: %w", err)
+		}
+	}
 	if err := d.RemoveAllServices(); err != nil {
 		return err
 	}
@@ -395,9 +427,7 @@ func (d *device) Connect(p Peripheral) {
 	d.plistmu.Lock()
 	if err := context.Cause(d.ctx); err != nil {
 		d.plistmu.Unlock()
-		if d.peripheralConnected != nil {
-			go d.peripheralConnected(p, err)
-		}
+		d.reportConnectError(p, err)
 		return
 	}
 	previous := d.plist[pp.ID()]
@@ -408,9 +438,7 @@ func (d *device) Connect(p Peripheral) {
 			err = io.ErrClosedPipe
 		}
 		d.plistmu.Unlock()
-		if d.peripheralConnected != nil {
-			go d.peripheralConnected(p, err)
-		}
+		d.reportConnectError(p, err)
 		return
 	}
 	if previous == nil {
@@ -815,12 +843,18 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 		if p.name == "" && previous != nil {
 			p.name = previous.name
 		}
+		var connected func()
+		if f := d.peripheralConnected; f != nil {
+			connected = func() { f(p, nil) }
+		}
+		if p.callbackQueue(d, connected) == nil {
+			d.plistmu.Unlock()
+			p.stop(errDarwinCallbackCapacity)
+			d.fail(errDarwinCallbackCapacity)
+			return
+		}
 		d.plist[xpc.UUID(u.b).String()] = p
 		d.plistmu.Unlock()
-
-		if d.peripheralConnected != nil {
-			go d.peripheralConnected(p, nil)
-		}
 
 	case peripheralDisconnected:
 		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
@@ -836,12 +870,22 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 			cause = nil
 		}
 		p.stop(io.ErrClosedPipe)
-		if d.peripheralDisconnected != nil {
-			callbackPeripheral := p
-			if p.connectSource != nil {
-				callbackPeripheral = p.connectSource
+		if p.cancel == nil {
+			// A pending argument can be reused for another attempt. Do not
+			// attach a completed connected-session queue to that public object.
+			if f := d.peripheralDisconnected; f != nil {
+				callbackPeripheral := p
+				if p.connectSource != nil {
+					callbackPeripheral = p.connectSource
+				}
+				if !d.startPeripheralCallout(func() { f(callbackPeripheral, cause) }) {
+					d.fail(errDarwinCallbackCapacity)
+				}
 			}
-			go d.peripheralDisconnected(callbackPeripheral, cause) // TODO: Get Result as error?
+			return
+		}
+		if !d.finishPeripheralCallbacks(p, cause) {
+			d.fail(errDarwinCallbackCapacity)
 		}
 
 	case // Peripheral events
@@ -905,15 +949,17 @@ func (d *device) fail(err error) {
 	for _, p := range peripherals {
 		p.stop(err)
 		if p.cancel == nil {
-			if d.peripheralConnected != nil {
+			if f := d.peripheralConnected; f != nil {
 				callbackPeripheral := p
 				if p.connectSource != nil {
 					callbackPeripheral = p.connectSource
 				}
-				go d.peripheralConnected(callbackPeripheral, err)
+				// Done/Err already report session termination if all callback
+				// slots remain occupied by application code.
+				d.startPeripheralCallout(func() { f(callbackPeripheral, err) })
 			}
-		} else if d.peripheralDisconnected != nil {
-			go d.peripheralDisconnected(p, err)
+		} else {
+			d.finishPeripheralCallbacks(p, err)
 		}
 	}
 	d.subscribersmu.Lock()

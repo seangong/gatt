@@ -75,6 +75,10 @@ func (d *overflowTestDevice) Write(b []byte) (int, error) {
 	return 0, io.ErrClosedPipe
 }
 
+func (d *overflowTestDevice) writeACL(b []byte, submit aclSubmitFunc) (int, error) {
+	return submit(func() (int, error) { return d.Write(b) })
+}
+
 func (*overflowTestDevice) Close() error { return nil }
 
 func TestHCIReceiveQueuePreservesOrderAndStopsOnOverflow(t *testing.T) {

@@ -127,7 +127,7 @@ func TestOutgoingConnectionNameFallbackKeepsLatestNonemptyName(t *testing.T) {
 				source := &PlatData{Name: tt.known, Address: [6]byte{1}}
 				result := resultTestStart(t, h, d, source, 0)
 				h.plistmu.Lock()
-				h.plist[peerAddress{source.Address, source.AddressType}] = &advertisementEntry{data: PlatData{Name: tt.latest, Address: source.Address, AddressType: source.AddressType}}
+				h.advertisementLocked(peerAddress{source.Address, source.AddressType}, true).data = PlatData{Name: tt.latest, Address: source.Address, AddressType: source.AddressType}
 				h.plistmu.Unlock()
 				connectionNameComplete(d, source, 1, 0)
 				got := resultTestRead(t, result)
@@ -160,7 +160,7 @@ func TestInboundSameAddressDoesNotBorrowPendingOutgoingName(t *testing.T) {
 			t.Fatal("inbound connection released the pending outgoing attempt")
 		}
 		h.plistmu.Lock()
-		h.plist[peerAddress{source.Address, source.AddressType}] = &advertisementEntry{data: PlatData{Address: source.Address, AddressType: source.AddressType}}
+		h.advertisementLocked(peerAddress{source.Address, source.AddressType}, true).data = PlatData{Address: source.Address, AddressType: source.AddressType}
 		h.plistmu.Unlock()
 		connectionNameComplete(d, source, 1, 0)
 		if got := resultTestRead(t, result); got.Err != nil || got.Peripheral.Name != "Outgoing" {
@@ -178,7 +178,7 @@ func TestReconnectionCapturesEachAttemptsName(t *testing.T) {
 			source := &PlatData{Name: name, Address: [6]byte{1}}
 			result := resultTestStart(t, h, d, source, 0)
 			h.plistmu.Lock()
-			h.plist[peerAddress{source.Address, source.AddressType}] = &advertisementEntry{data: PlatData{Address: source.Address, AddressType: source.AddressType}}
+			h.advertisementLocked(peerAddress{source.Address, source.AddressType}, true).data = PlatData{Address: source.Address, AddressType: source.AddressType}
 			h.plistmu.Unlock()
 			connectionNameComplete(d, source, 1, 0)
 			got := resultTestRead(t, result)

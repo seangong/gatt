@@ -29,6 +29,11 @@ func (d *pendingDisconnectTestDevice) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+func (d *pendingDisconnectTestDevice) writeACL(b []byte, submit aclSubmitFunc) (int, error) {
+	// The fixture's bounded command buffer admits each non-blocking attempt.
+	return submit(func() (int, error) { return d.Write(b) })
+}
+
 func (d *pendingDisconnectTestDevice) Close() error {
 	d.closeCalls.Add(1)
 	d.closeOnce.Do(func() { close(d.closed) })
