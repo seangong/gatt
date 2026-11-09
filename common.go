@@ -1,6 +1,9 @@
 package gatt
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // Supported statuses for GATT characteristic read/write operations.
 // These are API statuses, not ATT error codes.
@@ -77,9 +80,11 @@ func (p Property) String() (result string) {
 }
 
 // A Service is a BLE service.
+// A Service must not be copied after first use.
 type Service struct {
-	uuid  UUID
-	chars []*Characteristic
+	uuid    UUID
+	charsMu sync.RWMutex // Protects publication of chars.
+	chars   []*Characteristic
 
 	h    uint16
 	endh uint16
@@ -94,6 +99,8 @@ func NewService(u UUID) *Service {
 // AddCharacteristic panics if the service already contains another
 // characteristic with the same UUID.
 func (s *Service) AddCharacteristic(u UUID) *Characteristic {
+	s.charsMu.Lock()
+	defer s.charsMu.Unlock()
 	for _, c := range s.chars {
 		if c.uuid.Equal(u) {
 			panic("service already contains a characteristic with uuid " + u.String())
@@ -126,19 +133,30 @@ func (s *Service) SetHandle(h uint16) { s.h = h }
 func (s *Service) SetEndHandle(endh uint16) { s.endh = endh }
 
 // SetCharacteristics sets the Characteristics of the service.
-func (s *Service) SetCharacteristics(chars []*Characteristic) { s.chars = chars }
+func (s *Service) SetCharacteristics(chars []*Characteristic) {
+	s.charsMu.Lock()
+	s.chars = chars
+	s.charsMu.Unlock()
+}
 
 // Characteristic returns the contained characteristic of this service.
-func (s *Service) Characteristics() []*Characteristic { return s.chars }
+func (s *Service) Characteristics() []*Characteristic {
+	s.charsMu.RLock()
+	defer s.charsMu.RUnlock()
+	return s.chars
+}
 
 // A Characteristic is a BLE characteristic.
+// A Characteristic must not be copied after first use.
 type Characteristic struct {
 	uuid   UUID
 	props  Property // enabled properties
 	secure Property // security enabled properties
 	svc    *Service
-	cccd   *Descriptor
-	descs  []*Descriptor
+
+	descsMu sync.RWMutex // Protects publication of descs and cccd.
+	cccd    *Descriptor
+	descs   []*Descriptor
 
 	value []byte
 
@@ -175,7 +193,11 @@ func (c *Characteristic) VHandle() uint16 { return c.vh }
 func (c *Characteristic) EndHandle() uint16 { return c.endh }
 
 // Descriptor returns the Descriptor of the characteristic.
-func (c *Characteristic) Descriptor() *Descriptor { return c.cccd }
+func (c *Characteristic) Descriptor() *Descriptor {
+	c.descsMu.RLock()
+	defer c.descsMu.RUnlock()
+	return c.cccd
+}
 
 // SetHandle sets the Handle of the characteristic.
 func (c *Characteristic) SetHandle(h uint16) { c.h = h }
@@ -187,10 +209,18 @@ func (c *Characteristic) SetVHandle(vh uint16) { c.vh = vh }
 func (c *Characteristic) SetEndHandle(endh uint16) { c.endh = endh }
 
 // SetDescriptor sets the Descriptor of the characteristic.
-func (c *Characteristic) SetDescriptor(cccd *Descriptor) { c.cccd = cccd }
+func (c *Characteristic) SetDescriptor(cccd *Descriptor) {
+	c.descsMu.Lock()
+	c.cccd = cccd
+	c.descsMu.Unlock()
+}
 
 // SetDescriptors sets the list of Descriptor of the characteristic.
-func (c *Characteristic) SetDescriptors(descs []*Descriptor) { c.descs = descs }
+func (c *Characteristic) SetDescriptors(descs []*Descriptor) {
+	c.descsMu.Lock()
+	c.descs = descs
+	c.descsMu.Unlock()
+}
 
 // UUID returns the UUID of the characteristic.
 func (c *Characteristic) UUID() UUID {
@@ -215,6 +245,8 @@ func (c *Characteristic) Properties() Property {
 
 // Descriptors returns the contained descriptors of this characteristic.
 func (c *Characteristic) Descriptors() []*Descriptor {
+	c.descsMu.RLock()
+	defer c.descsMu.RUnlock()
 	return c.descs
 }
 
@@ -222,6 +254,8 @@ func (c *Characteristic) Descriptors() []*Descriptor {
 // AddDescriptor panics if the characteristic already contains another
 // descriptor with the same UUID.
 func (c *Characteristic) AddDescriptor(u UUID) *Descriptor {
+	c.descsMu.Lock()
+	defer c.descsMu.Unlock()
 	for _, d := range c.descs {
 		if d.uuid.Equal(u) {
 			panic("service already contains a characteristic with uuid " + u.String())
@@ -284,6 +318,8 @@ func (c *Characteristic) HandleWriteFunc(f func(r Request, data []byte) (status 
 // notification requests to h. HandleNotify must be called before the
 // containing service is added to a server.
 func (c *Characteristic) HandleNotify(h NotifyHandler) {
+	c.descsMu.Lock()
+	defer c.descsMu.Unlock()
 	if c.cccd != nil {
 		return
 	}

@@ -232,18 +232,19 @@ func (p *peripheral) DiscoverCharacteristics(cs []UUID, s *Service) ([]*Characte
 		return nil, err
 	}
 	if p.characteristicsDiscovered[s] {
-		if len(s.chars) != len(chars) {
+		oldChars := s.Characteristics()
+		if len(oldChars) != len(chars) {
 			return nil, p.databaseChanged("characteristics")
 		}
 		for i, c := range chars {
-			old := s.chars[i]
+			old := oldChars[i]
 			if old.h != c.h || old.vh != c.vh || old.endh != c.endh || old.props != c.props || !old.uuid.Equal(c.uuid) {
 				return nil, p.databaseChanged("characteristics")
 			}
 		}
-		return s.chars, nil
+		return oldChars, nil
 	}
-	s.chars = chars
+	s.SetCharacteristics(chars)
 	if p.characteristicsDiscovered == nil {
 		p.characteristicsDiscovered = make(map[*Service]bool)
 	}
@@ -317,18 +318,21 @@ func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descr
 		return nil, err
 	}
 	if p.descriptorsDiscovered[c] {
-		if len(c.descs) != len(descs) {
+		oldDescs := c.Descriptors()
+		if len(oldDescs) != len(descs) {
 			return nil, p.databaseChanged("descriptors")
 		}
 		for i, d := range descs {
-			old := c.descs[i]
+			old := oldDescs[i]
 			if old.h != d.h || !old.uuid.Equal(d.uuid) {
 				return nil, p.databaseChanged("descriptors")
 			}
 		}
-		return c.descs, nil
+		return oldDescs, nil
 	}
+	c.descsMu.Lock()
 	c.descs, c.cccd = descs, cccd
+	c.descsMu.Unlock()
 	if p.descriptorsDiscovered == nil {
 		p.descriptorsDiscovered = make(map[*Characteristic]bool)
 	}
@@ -453,7 +457,8 @@ func (p *peripheral) setNotifyValue(c *Characteristic, flag uint16,
 		return err
 	}
 	defer p.unlockMetadata()
-	if c.cccd == nil {
+	cccd := c.Descriptor()
+	if cccd == nil {
 		return errors.New("no cccd") // FIXME
 	}
 	ccc := uint16(0)
@@ -465,7 +470,7 @@ func (p *peripheral) setNotifyValue(c *Characteristic, flag uint16,
 	b := make([]byte, 5)
 	op := byte(attOpWriteReq)
 	b[0] = op
-	binary.LittleEndian.PutUint16(b[1:3], c.cccd.h)
+	binary.LittleEndian.PutUint16(b[1:3], cccd.h)
 	binary.LittleEndian.PutUint16(b[3:5], ccc)
 
 	if _, err := p.sendReq(op, b); err != nil {

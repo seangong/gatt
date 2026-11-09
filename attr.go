@@ -1,6 +1,9 @@
 package gatt
 
-import "log"
+import (
+	"fmt"
+	"log"
+)
 
 // attr is a BLE attribute. It is not exported;
 // managing attributes is an implementation detail.
@@ -88,6 +91,30 @@ func dumpAttributes(aa []attr) {
 	}
 }
 
+// Registration checks capacity before generation can change public handles.
+// Services and their configuration are prepared before registration.
+func validateAttributeCount(ss []*Service) error {
+	remaining := 0xffff
+	for _, s := range ss {
+		if remaining < 1 {
+			return fmt.Errorf("attribute table exceeds 65535 handles: %w", ErrInvalidLength)
+		}
+		remaining--
+		for _, c := range s.Characteristics() {
+			if remaining < 2 {
+				return fmt.Errorf("attribute table exceeds 65535 handles: %w", ErrInvalidLength)
+			}
+			remaining -= 2
+			descriptors := len(c.Descriptors())
+			if descriptors > remaining {
+				return fmt.Errorf("attribute table exceeds 65535 handles: %w", ErrInvalidLength)
+			}
+			remaining -= descriptors
+		}
+	}
+	return nil
+}
+
 func generateAttributes(ss []*Service, base uint16) *attrRange {
 	var aa []attr
 	h := base
@@ -153,7 +180,7 @@ func generateCharAttributes(c *Characteristic, h uint16) (uint16, []attr) {
 	h += 2
 
 	aa := []attr{ca, va}
-	for _, d := range c.descs {
+	for _, d := range c.Descriptors() {
 		a := generateDescAttributes(d, h)
 		if d.uuid.Equal(attrClientCharacteristicConfigUUID) {
 			a.valueHandle = valueHandle

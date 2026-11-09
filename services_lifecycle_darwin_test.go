@@ -339,8 +339,8 @@ func TestDarwinServicesSubscriptionRegistrationPrecedesRemove(t *testing.T) {
 	}()
 	subscribed := make(chan struct{})
 	go func() { darwinSubscribeForTest(d, id); close(subscribed) }()
-	// HandleXpcEvent checks context first. The second check pauses startNotify
-	// after lookup but before notifier registration, with no production hook.
+	// HandleXpcEvent checks context first. The second check pauses the admitted
+	// subscription before notifier registration, with no production hook.
 	receiveDarwin(t, paused.entered)
 	removed := make(chan error, 1)
 	go func() { removed <- d.RemoveAllServices() }()

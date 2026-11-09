@@ -11,7 +11,7 @@ import (
 func TestAdvertisementCalloutOwnsItsReport(t *testing.T) {
 	received := make(chan *PlatData, 1)
 	release, returned := make(chan struct{}), make(chan struct{})
-	h := &HCI{connsmu: &sync.Mutex{}, plistmu: &sync.Mutex{}, plist: make(map[bdaddr]*PlatData)}
+	h := &HCI{connsmu: &sync.Mutex{}, plistmu: &sync.Mutex{}, plist: make(map[peerAddress]*advertisementEntry)}
 	h.AdvertisementHandler = func(pd *PlatData) { received <- pd; <-release; close(returned) }
 	defer func() {
 		close(release)
@@ -40,8 +40,8 @@ func TestAdvertisementCalloutOwnsItsReport(t *testing.T) {
 	}
 	pd.Name = "parsed name"
 	pd.Data[0] = 'x'
-	cached := h.plist[pd.Address]
-	if !bytes.Equal(cached.Data, []byte{2, 9, 'a', 2, 9, 'b', 2, 9, 'c'}) || cached.Name != "" {
+	cached := h.plist[peerAddress{pd.Address, pd.AddressType}].data
+	if !bytes.Equal(cached.Data, []byte{2, 9, 'a', 2, 9, 'c'}) || cached.Name != "" {
 		t.Fatalf("callback changed cached report: %+v", cached)
 	}
 }
@@ -62,7 +62,7 @@ func TestAdvertisementPayloadBoundaries(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				h := &HCI{connsmu: &sync.Mutex{}, plistmu: &sync.Mutex{}, plist: make(map[bdaddr]*PlatData)}
+				h := &HCI{connsmu: &sync.Mutex{}, plistmu: &sync.Mutex{}, plist: make(map[peerAddress]*advertisementEntry)}
 				reports := make(chan *PlatData, 2)
 				h.AdvertisementHandler = func(pd *PlatData) { reports <- pd }
 				report := func(kind byte, data []byte) []byte {
@@ -93,7 +93,7 @@ func TestAdvertisementPayloadBoundaries(t *testing.T) {
 
 func TestAdvertisementCallbackTiming(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		h := &HCI{connsmu: &sync.Mutex{}, plistmu: &sync.Mutex{}, plist: make(map[bdaddr]*PlatData)}
+		h := &HCI{connsmu: &sync.Mutex{}, plistmu: &sync.Mutex{}, plist: make(map[peerAddress]*advertisementEntry)}
 		reports := make(chan *PlatData, 1)
 		h.AdvertisementHandler = func(pd *PlatData) { reports <- pd }
 		report := func(kind byte) []byte {
@@ -121,7 +121,7 @@ func TestAdvertisementCallbackTiming(t *testing.T) {
 
 func TestAdvertisementRejectsTruncatedReports(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		h := &HCI{connsmu: &sync.Mutex{}, plistmu: &sync.Mutex{}, plist: make(map[bdaddr]*PlatData)}
+		h := &HCI{connsmu: &sync.Mutex{}, plistmu: &sync.Mutex{}, plist: make(map[peerAddress]*advertisementEntry)}
 		reports := make(chan *PlatData, 1)
 		h.AdvertisementHandler = func(pd *PlatData) { reports <- pd }
 		packet := []byte{2, 1, advNonconnInd, 0, 1, 2, 3, 4, 5, 6, 3, 2, 9, 'n', 0xc4}

@@ -29,7 +29,7 @@ type HCI struct {
 	c *cmd.Cmd
 	e *evt.Evt
 
-	plist   map[bdaddr]*PlatData
+	plist   map[peerAddress]*advertisementEntry
 	plistmu *sync.Mutex
 
 	bufCnt  chan struct{}
@@ -65,7 +65,18 @@ type HCI struct {
 	advGate chan struct{} // Serialize advertising intent and complete configuration operations.
 }
 
-type bdaddr [6]byte
+type peerAddress struct {
+	address     [6]byte
+	addressType uint8
+}
+
+// The advertising payload is kept separately from the latest combined report.
+// A Connect argument can seed metadata without representing an observed ADV.
+type advertisementEntry struct {
+	data             PlatData
+	advertisingData  []byte
+	hasAdvertisement bool
+}
 
 type PlatData struct {
 	Name        string
@@ -136,7 +147,7 @@ func NewHCI(devID int, chk bool, maxConn int) (*HCI, error) {
 		c: c,
 		e: e,
 
-		plist:   make(map[bdaddr]*PlatData),
+		plist:   make(map[peerAddress]*advertisementEntry),
 		plistmu: &sync.Mutex{},
 
 		bufCnt:  make(chan struct{}, 15-1),
@@ -149,11 +160,7 @@ func NewHCI(devID int, chk bool, maxConn int) (*HCI, error) {
 		advmu: &sync.Mutex{},
 	}
 
-	e.HandleEvent(evt.LEMeta, evt.HandlerFunc(h.handleLEMeta))
-	e.HandleEvent(evt.DisconnectionComplete, evt.HandlerFunc(h.handleDisconnectionComplete))
-	e.HandleEvent(evt.NumberOfCompletedPkts, evt.HandlerFunc(h.handleNumberOfCompletedPkts))
-	e.HandleEvent(evt.CommandComplete, evt.HandlerFunc(c.HandleComplete))
-	e.HandleEvent(evt.CommandStatus, evt.HandlerFunc(c.HandleStatus))
+	h.registerEventHandlers()
 
 	ctx, cancel := context.WithTimeout(context.Background(), hciCloseTimeout)
 	defer cancel()
@@ -182,6 +189,28 @@ func NewHCI(devID int, chk bool, maxConn int) (*HCI, error) {
 		return nil, h.Close()
 	}
 	return h, nil
+}
+
+func (h *HCI) registerEventHandlers() {
+	h.e.HandleEvent(evt.LEMeta, evt.HandlerFunc(h.handleLEMeta))
+	h.e.HandleEvent(evt.DisconnectionComplete, evt.HandlerFunc(h.handleDisconnectionComplete))
+	h.e.HandleEvent(evt.NumberOfCompletedPkts, evt.HandlerFunc(h.handleNumberOfCompletedPkts))
+	h.e.HandleEvent(evt.CommandComplete, evt.HandlerFunc(h.c.HandleComplete))
+	h.e.HandleEvent(evt.CommandStatus, evt.HandlerFunc(h.c.HandleStatus))
+	h.e.HandleEvent(evt.HardwareError, evt.HandlerFunc(h.handleHardwareError))
+}
+
+// Controller failure makes queued work and connection state unreliable. Use
+// asynchronous shutdown so the HCI receiver never waits for its own completion.
+func (h *HCI) handleHardwareError(b []byte) error {
+	var err error
+	if len(b) != 1 {
+		err = fmt.Errorf("hci: invalid hardware-error event length %d, want 1", len(b))
+	} else {
+		err = fmt.Errorf("hci: controller hardware error 0x%02x", b[0])
+	}
+	h.requestClose(err)
+	return err
 }
 
 // initLifecycle is called with connsmu held. Tests can construct an HCI directly.
@@ -539,7 +568,13 @@ func (h *HCI) connect(pd *PlatData, withResult bool) (*connectionAttempt, error)
 	report := *pd
 	report.Data = append([]byte(nil), pd.Data...)
 	h.plistmu.Lock()
-	h.plist[pd.Address] = &report
+	key := peerAddress{pd.Address, pd.AddressType}
+	entry := h.plist[key]
+	if entry == nil {
+		entry = &advertisementEntry{}
+		h.plist[key] = entry
+	}
+	entry.data = report
 	h.plistmu.Unlock()
 	_, err := h.c.Send(
 		cmd.LECreateConn{
@@ -791,10 +826,13 @@ func (h *HCI) handlePacket(b []byte) {
 		// A malformed lifecycle/flow-control event can leave credits or
 		// connection ownership unknowable. Unsupported events and advertising
 		// errors retain their previous non-fatal handling.
-		if err != nil && len(b) != 0 && (b[0] == evt.NumberOfCompletedPkts ||
-			b[0] == evt.DisconnectionComplete ||
-			b[0] == evt.LEMeta && len(b) > 2 && b[2] == byte(evt.LEConnectionComplete)) {
-			h.requestClose(err)
+		if err != nil && len(b) != 0 {
+			if b[0] == evt.HardwareError {
+				h.requestClose(fmt.Errorf("hci: invalid hardware-error event: %w", err))
+			} else if b[0] == evt.NumberOfCompletedPkts || b[0] == evt.DisconnectionComplete ||
+				b[0] == evt.LEMeta && len(b) > 2 && b[2] == byte(evt.LEConnectionComplete) {
+				h.requestClose(err)
+			}
 		}
 	case typVendorPkt:
 		err = fmt.Errorf("Vendor packet not supported")
@@ -895,7 +933,7 @@ func (h *HCI) handleAdvertisement(b []byte) {
 		return
 	}
 	for i := 0; i < int(ep.NumReports); i++ {
-		addr := bdaddr(ep.Address[i])
+		addr := peerAddress{ep.Address[i], ep.AddressType[i]}
 		et := ep.EventType[i]
 		connectable := et == advInd || et == advDirectInd
 		scannable := et == advInd || et == advScanInd
@@ -903,15 +941,18 @@ func (h *HCI) handleAdvertisement(b []byte) {
 
 		if et == scanRsp {
 			h.plistmu.Lock()
-			pd, ok := h.plist[addr]
+			entry := h.plist[addr]
 			var report PlatData
-			if ok {
-				pd.Data = append(pd.Data, data...)
-				report = *pd
-				report.Data = append([]byte(nil), pd.Data...)
+			found := entry != nil && entry.hasAdvertisement
+			if found {
+				combined := make([]byte, 0, len(entry.advertisingData)+len(data))
+				combined = append(combined, entry.advertisingData...)
+				entry.data.Data = append(combined, data...)
+				report = entry.data
+				report.Data = append([]byte(nil), report.Data...)
 			}
 			h.plistmu.Unlock()
-			if ok {
+			if found {
 				h.callout(func() { h.AdvertisementHandler(&report) })
 			}
 			continue
@@ -925,7 +966,9 @@ func (h *HCI) handleAdvertisement(b []byte) {
 			RSSI:        ep.RSSI[i],
 		}
 		h.plistmu.Lock()
-		h.plist[addr] = pd
+		h.plist[addr] = &advertisementEntry{
+			data: *pd, advertisingData: data, hasAdvertisement: true,
+		}
 		h.plistmu.Unlock()
 		if scannable {
 			continue
@@ -1060,7 +1103,7 @@ func (h *HCI) handleConnection(b []byte) {
 				return
 			}
 		}
-		pd := &PlatData{Address: ep.PeerAddress, Conn: c}
+		pd := &PlatData{Address: ep.PeerAddress, AddressType: ep.PeerAddressType, Conn: c}
 		// master connection
 		if ep.Role == 0x01 {
 			if h.AcceptMasterHandler != nil && !h.callout(func() { h.AcceptMasterHandler(pd) }) {
@@ -1069,8 +1112,9 @@ func (h *HCI) handleConnection(b []byte) {
 			return
 		}
 		h.plistmu.Lock()
-		if advertised := h.plist[ep.PeerAddress]; advertised != nil {
-			*pd = *advertised
+		if advertised := h.plist[peerAddress{ep.PeerAddress, ep.PeerAddressType}]; advertised != nil {
+			*pd = advertised.data
+			pd.Data = append([]byte(nil), advertised.data.Data...)
 			pd.Conn = c
 		}
 		h.plistmu.Unlock()

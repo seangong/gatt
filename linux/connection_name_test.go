@@ -97,7 +97,7 @@ func TestOutgoingConnectionNameSurvivesContinuousScanning(t *testing.T) {
 					t.Fatalf("connected metadata = %+v", connected)
 				}
 				h.plistmu.Lock()
-				cached := *h.plist[address]
+				cached := h.plist[peerAddress{address, source.AddressType}].data
 				h.plistmu.Unlock()
 				if cached.Name != "" || !bytes.Equal(cached.Data, latestData) || source.Name != "caller-owned" || source.Conn != nil || !bytes.Equal(source.Data, initialData) || latest.Name != "scan-owned" {
 					t.Fatal("connection completion changed a cache or published scan snapshot")
@@ -127,7 +127,7 @@ func TestOutgoingConnectionNameFallbackKeepsLatestNonemptyName(t *testing.T) {
 				source := &PlatData{Name: tt.known, Address: [6]byte{1}}
 				result := resultTestStart(t, h, d, source, 0)
 				h.plistmu.Lock()
-				h.plist[source.Address] = &PlatData{Name: tt.latest, Address: source.Address}
+				h.plist[peerAddress{source.Address, source.AddressType}] = &advertisementEntry{data: PlatData{Name: tt.latest, Address: source.Address, AddressType: source.AddressType}}
 				h.plistmu.Unlock()
 				connectionNameComplete(d, source, 1, 0)
 				got := resultTestRead(t, result)
@@ -160,7 +160,7 @@ func TestInboundSameAddressDoesNotBorrowPendingOutgoingName(t *testing.T) {
 			t.Fatal("inbound connection released the pending outgoing attempt")
 		}
 		h.plistmu.Lock()
-		h.plist[source.Address] = &PlatData{Address: source.Address}
+		h.plist[peerAddress{source.Address, source.AddressType}] = &advertisementEntry{data: PlatData{Address: source.Address, AddressType: source.AddressType}}
 		h.plistmu.Unlock()
 		connectionNameComplete(d, source, 1, 0)
 		if got := resultTestRead(t, result); got.Err != nil || got.Peripheral.Name != "Outgoing" {
@@ -178,7 +178,7 @@ func TestReconnectionCapturesEachAttemptsName(t *testing.T) {
 			source := &PlatData{Name: name, Address: [6]byte{1}}
 			result := resultTestStart(t, h, d, source, 0)
 			h.plistmu.Lock()
-			h.plist[source.Address] = &PlatData{Address: source.Address}
+			h.plist[peerAddress{source.Address, source.AddressType}] = &advertisementEntry{data: PlatData{Address: source.Address, AddressType: source.AddressType}}
 			h.plistmu.Unlock()
 			connectionNameComplete(d, source, 1, 0)
 			got := resultTestRead(t, result)

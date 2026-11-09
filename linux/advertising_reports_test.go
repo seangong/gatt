@@ -11,7 +11,7 @@ func TestMultipleAdvertisingReportsReachCallbacks(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := &HCI{
 			connsmu: &sync.Mutex{}, plistmu: &sync.Mutex{},
-			plist: make(map[bdaddr]*PlatData), maxConn: 2,
+			plist: make(map[peerAddress]*advertisementEntry), maxConn: 2,
 		}
 		reports := make(chan *PlatData, 2)
 		h.AdvertisementHandler = func(pd *PlatData) { reports <- pd }

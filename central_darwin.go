@@ -85,13 +85,15 @@ func (c *central) startNotify(a *attr, maxlen int) {
 	go char.nhandler.ServeNotify(Request{Central: c}, n)
 }
 
-func (c *central) stopNotify(a *attr) {
+// stopNotify reports whether the central has no remaining subscriptions.
+func (c *central) stopNotify(a *attr) bool {
 	c.notifiersmu.Lock()
 	defer c.notifiersmu.Unlock()
 	if n, found := c.notifiers[a.nativeID]; found {
 		n.stop()
 		delete(c.notifiers, a.nativeID)
 	}
+	return len(c.notifiers) == 0
 }
 
 func (c *central) stopNotifiers() {

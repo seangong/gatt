@@ -149,13 +149,10 @@ func newSubmissionTestHCI(t *testing.T, poll bool) (*HCI, *submissionTestTranspo
 	h := &HCI{
 		d: d, c: cmd.NewCmd(d), e: evt.NewEvt(), maxConn: 4,
 		connsmu: &sync.Mutex{}, conns: make(map[uint16]*conn),
-		plistmu: &sync.Mutex{}, plist: make(map[bdaddr]*PlatData), advmu: &sync.Mutex{},
+		plistmu: &sync.Mutex{}, plist: make(map[peerAddress]*advertisementEntry), advmu: &sync.Mutex{},
 		bufSize: 27, bufCnt: make(chan struct{}, 14),
 	}
-	h.e.HandleEvent(evt.CommandComplete, evt.HandlerFunc(h.c.HandleComplete))
-	h.e.HandleEvent(evt.NumberOfCompletedPkts, evt.HandlerFunc(h.handleNumberOfCompletedPkts))
-	h.e.HandleEvent(evt.DisconnectionComplete, evt.HandlerFunc(h.handleDisconnectionComplete))
-	h.e.HandleEvent(evt.LEMeta, evt.HandlerFunc(h.handleLEMeta))
+	h.registerEventHandlers()
 	go h.mainLoop()
 	synctest.Wait()
 	t.Cleanup(func() { d.Close(); <-h.requestClose(io.ErrClosedPipe) })

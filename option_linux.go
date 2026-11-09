@@ -40,7 +40,11 @@ func LnxSetAdvertisingEnable(en bool) Option {
 		if dd == nil || dd.hci == nil {
 			return errors.New("device is not initialized")
 		}
-		if err := dd.update(); err != nil {
+		if err := dd.lockAdvertising(); err != nil {
+			return err
+		}
+		defer dd.unlockAdvertising()
+		if err := dd.update(dd.hci); err != nil {
 			return err
 		}
 		return dd.hci.SetAdvertiseEnable(en)
@@ -51,7 +55,12 @@ func LnxSetAdvertisingEnable(en bool) Option {
 // This option can be used with NewDevice or Option on Linux implementation.
 func LnxSetAdvertisingData(c *cmd.LESetAdvertisingData) Option {
 	return func(d Device) error {
-		d.(*device).advData = c
+		dd := d.(*device)
+		if err := dd.lockAdvertising(); err != nil {
+			return err
+		}
+		defer dd.unlockAdvertising()
+		dd.advData = c
 		return nil
 	}
 }
@@ -60,7 +69,12 @@ func LnxSetAdvertisingData(c *cmd.LESetAdvertisingData) Option {
 // This option can be used with NewDevice or Option on Linux implementation.
 func LnxSetScanResponseData(c *cmd.LESetScanResponseData) Option {
 	return func(d Device) error {
-		d.(*device).scanResp = c
+		dd := d.(*device)
+		if err := dd.lockAdvertising(); err != nil {
+			return err
+		}
+		defer dd.unlockAdvertising()
+		dd.scanResp = c
 		return nil
 	}
 }
@@ -69,7 +83,12 @@ func LnxSetScanResponseData(c *cmd.LESetScanResponseData) Option {
 // This option can be used with NewDevice or Option on Linux implementation.
 func LnxSetAdvertisingParameters(c *cmd.LESetAdvertisingParameters) Option {
 	return func(d Device) error {
-		d.(*device).advParam = c
+		dd := d.(*device)
+		if err := dd.lockAdvertising(); err != nil {
+			return err
+		}
+		defer dd.unlockAdvertising()
+		dd.advParam = c
 		return nil
 	}
 }

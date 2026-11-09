@@ -87,15 +87,11 @@ func newShutdownTestHCI(t *testing.T, blockWrite bool) (*HCI, *shutdownTestTrans
 	h := &HCI{
 		d: d, c: cmd.NewCmd(d), e: evt.NewEvt(),
 		connsmu: &sync.Mutex{}, conns: make(map[uint16]*conn),
-		plistmu: &sync.Mutex{}, plist: make(map[bdaddr]*PlatData),
+		plistmu: &sync.Mutex{}, plist: make(map[peerAddress]*advertisementEntry),
 		advmu: &sync.Mutex{}, maxConn: 4,
 		bufSize: 27, bufCnt: make(chan struct{}, 14),
 	}
-	h.e.HandleEvent(evt.CommandStatus, evt.HandlerFunc(h.c.HandleStatus))
-	h.e.HandleEvent(evt.CommandComplete, evt.HandlerFunc(h.c.HandleComplete))
-	h.e.HandleEvent(evt.NumberOfCompletedPkts, evt.HandlerFunc(h.handleNumberOfCompletedPkts))
-	h.e.HandleEvent(evt.DisconnectionComplete, evt.HandlerFunc(h.handleDisconnectionComplete))
-	h.e.HandleEvent(evt.LEMeta, evt.HandlerFunc(h.handleLEMeta))
+	h.registerEventHandlers()
 	go h.mainLoop()
 	synctest.Wait()
 	t.Cleanup(func() {

@@ -203,19 +203,20 @@ func (p *peripheral) DiscoverCharacteristics(cs []UUID, s *Service) ([]*Characte
 	if err := context.Cause(p.context()); err != nil {
 		return nil, err
 	}
-	oldRows := darwinCharacteristics(s.chars)
+	oldChars := s.Characteristics()
+	oldRows := darwinCharacteristics(oldChars)
 	scope := p.characteristicScopes[s]
 	if scope.changed(oldRows, rows, cs) {
 		return nil, p.databaseChanged("characteristics")
 	}
-	byHandle := make(map[uint16]*Characteristic, len(s.chars)+len(found))
-	for _, old := range s.chars {
+	byHandle := make(map[uint16]*Characteristic, len(oldChars)+len(found))
+	for _, old := range oldChars {
 		if !inDiscoveryScope(cs, old.uuid) {
 			byHandle[old.h] = old
 		}
 	}
 	for i, current := range found {
-		for j, old := range s.chars {
+		for j, old := range oldChars {
 			if sameDarwinAttribute(oldRows[j], rows[i]) {
 				current = old
 				break
@@ -231,7 +232,7 @@ func (p *peripheral) DiscoverCharacteristics(cs []UUID, s *Service) ([]*Characte
 	if err := validDarwinAttributes(darwinCharacteristics(cache)); err != nil {
 		return nil, p.databaseChanged("characteristics")
 	}
-	s.chars = cache
+	s.SetCharacteristics(cache)
 	scope.record(rows, cs)
 	if p.characteristicScopes == nil {
 		p.characteristicScopes = make(map[*Service]discoveryScope)
@@ -287,19 +288,20 @@ func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descr
 	if err := context.Cause(p.context()); err != nil {
 		return nil, err
 	}
-	oldRows := darwinDescriptors(c.descs)
+	oldDescs := c.Descriptors()
+	oldRows := darwinDescriptors(oldDescs)
 	scope := p.descriptorScopes[c]
 	if scope.changed(oldRows, rows, ds) {
 		return nil, p.databaseChanged("descriptors")
 	}
-	byHandle := make(map[uint16]*Descriptor, len(c.descs)+len(found))
-	for _, old := range c.descs {
+	byHandle := make(map[uint16]*Descriptor, len(oldDescs)+len(found))
+	for _, old := range oldDescs {
 		if !inDiscoveryScope(ds, old.uuid) {
 			byHandle[old.h] = old
 		}
 	}
 	for i, current := range found {
-		for j, old := range c.descs {
+		for j, old := range oldDescs {
 			if sameDarwinAttribute(oldRows[j], rows[i]) {
 				current = old
 				break
@@ -315,7 +317,7 @@ func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descr
 	if err := validDarwinAttributes(darwinDescriptors(cache)); err != nil {
 		return nil, p.databaseChanged("descriptors")
 	}
-	cccd := c.cccd
+	cccd := c.Descriptor()
 	if inDiscoveryScope(ds, attrClientCharacteristicConfigUUID) {
 		cccd = nil
 	}
@@ -324,7 +326,9 @@ func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descr
 			cccd = current
 		}
 	}
+	c.descsMu.Lock()
 	c.descs, c.cccd = cache, cccd
+	c.descsMu.Unlock()
 	scope.record(rows, ds)
 	if p.descriptorScopes == nil {
 		p.descriptorScopes = make(map[*Characteristic]discoveryScope)

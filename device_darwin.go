@@ -632,13 +632,19 @@ func (d *device) respondToRequestStatus(id int, args xpc.Dict, forcedStatus attE
 			return
 		}
 		d.subscribersmu.Lock()
-		c := d.subscribers[u.String()]
+		if context.Cause(d.ctx) != nil {
+			d.subscribersmu.Unlock()
+			d.attrmu.RUnlock()
+			return
+		}
+		key := u.String()
+		c := d.subscribers[key]
 		if c == nil {
 			c = newCentral(d, u)
-			d.subscribers[u.String()] = c
+			d.subscribers[key] = c
 		}
-		d.subscribersmu.Unlock()
 		c.startNotify(attr, c.mtu)
+		d.subscribersmu.Unlock()
 		d.attrmu.RUnlock()
 
 	case 22: // unubscribed
@@ -646,16 +652,17 @@ func (d *device) respondToRequestStatus(id int, args xpc.Dict, forcedStatus attE
 		a := args.MustGetInt("kCBMsgArgAttributeID")
 		d.attrmu.RLock()
 		attr := d.attrs[a]
-		d.attrmu.RUnlock()
 		if attr == nil {
+			d.attrmu.RUnlock()
 			return
 		}
 		d.subscribersmu.Lock()
-		c := d.subscribers[u.String()]
-		d.subscribersmu.Unlock()
-		if c != nil {
-			c.stopNotify(attr)
+		key := u.String()
+		if c := d.subscribers[key]; c != nil && c.stopNotify(attr) {
+			delete(d.subscribers, key)
 		}
+		d.subscribersmu.Unlock()
+		d.attrmu.RUnlock()
 
 	case 23: // notificationSent
 	}
@@ -913,6 +920,7 @@ func (d *device) fail(err error) {
 	for _, c := range d.subscribers {
 		c.stopNotifiers()
 	}
+	d.subscribers = make(map[string]*central)
 	d.subscribersmu.Unlock()
 }
 

@@ -310,6 +310,11 @@ scan-response packets each have a 31-byte budget, including field headers.
 Advertise a discovery UUID that fits; clients can discover the remaining
 services after connecting.
 
+Linux `AddService` and `SetServices` support at most 65,535 attributes, including
+service and characteristic declarations and descriptors. A larger table returns
+an error matching `ErrInvalidLength` before changing the published table or
+assigning handles.
+
 `AppendUUIDFit` combines service UUIDs of the same width into one list. It
 preserves input priority and includes only whole UUIDs. A `false` result means
 some requested UUIDs were omitted; capacity exhaustion does not set `Err()`.
@@ -323,6 +328,11 @@ requested it, and a completed stop is not undone by a queued recovery task.
 fits in the advertising packet. Raw `Advertise` and custom scan-response options
 retain their existing behavior.
 
+Linux serializes complete advertising configurations and explicit advertising
+stops. Built-in advertising options use the same operation gate; option lists
+retain their ordered, partial-application behavior. Device shutdown cancels
+queued operations and interrupts controller IO without waiting for this gate.
+
 `AdvPacket` append methods retain their existing payload-truncation behavior.
 If even a field's two-byte header cannot fit, the packet keeps its previous
 contents and `Err()` reports `ErrEIRPacketTooLong`. `Advertise` returns that
@@ -333,6 +343,13 @@ options, check `Err()` first; `Bytes()` and `Len()` alone do not report errors.
 Linux scanning preserves valid fields when another advertising field is
 malformed. Padding and unparseable tails are removed separately from each
 advertising or scan-response payload before they are combined.
+
+The Linux scan cache distinguishes public and random address types, even when
+their address bytes are identical. A scan response replaces the previous scan
+response, including when empty; it is combined with the latest advertising
+payload. A new advertising report starts a new pair. Scan and connection
+callbacks receive independent data snapshots. Public MAC ID formatting is
+unchanged.
 
 Service UUID lists, solicitation lists and Service Data support 16-, 32- and
 128-bit UUIDs on the wire. Linux expands 32-bit UUIDs to their Bluetooth-base
@@ -412,6 +429,11 @@ queue is full, requests requiring a response return Insufficient Resources
 without invoking a business handler. Close cancels queued work without waiting
 for a handler that ignores cancellation.
 
+On macOS, canceling the last notification subscription releases its central
+registry entry. Other active characteristic subscriptions remain live, and a
+later subscription retains the same central ID. Closing the device stops all
+notifiers and releases the registry.
+
 Linux client discovery publishes its cache only after a complete successful
 discovery. Repeating discovery with the same attribute layout reuses the
 existing objects, CCCD and subscriptions. A failed or incomplete discovery
@@ -419,6 +441,13 @@ leaves the previous cache intact. If a later complete discovery finds a changed
 layout, it returns an error matching `errors.Is(err, gatt.ErrDatabaseChanged)`
 and closes that connection. Reconnect and rediscover before using attribute
 handles again. Discovery UUID filters remain unimplemented as listed above.
+
+`Service.Characteristics`, `Characteristic.Descriptors` and
+`Characteristic.Descriptor` may be read concurrently with discovery. Published
+collections retain their existing object identities. Returned slices still
+refer to the collection; callers must synchronize any direct mutations.
+Configuration still belongs before registration. Use `Service` and
+`Characteristic` through pointers; do not copy them after first use.
 
 The Linux client supports local `SetMTU` values from 23 through 517. An invalid
 local value is rejected without sending a request. A peer MTU below 23 leaves
@@ -449,6 +478,11 @@ Linux devices expose optional `StopContext(context.Context) error` and
 `Stop() error` methods. They are not part of the portable `Device` interface;
 use a capability assertion as in the example above. Other platforms do not
 provide the same shutdown contract.
+
+An HCI Hardware Error event terminates the Linux session through the existing
+fault shutdown path, releasing pending commands and connections. `Close`
+reports the controller's hardware code. Recovery requires reopening the device;
+this event does not trigger an automatic reset or replay of commands.
 
 Linux HCI commands remain serialized and also respect the controller's reported
 command allowance. Sending waits while that allowance is zero. Shutdown rejects

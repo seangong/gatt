@@ -44,6 +44,8 @@ type device struct {
 	scanResp  *cmd.LESetScanResponseData
 	advParam  *cmd.LESetAdvertisingParameters
 	scanParam *cmd.LESetScanParameters
+
+	advertisingGate chan struct{} // Initialized under mu; tokens serialize complete advertising operations.
 }
 
 func NewDevice(opts ...Option) (Device, error) {
@@ -282,6 +284,9 @@ func (d *device) AddService(s *Service) error {
 	}
 	services := append(append([]*Service(nil), d.svcs...), s)
 	d.mu.Unlock()
+	if err := validateAttributeCount(services); err != nil {
+		return err
+	}
 	attrs := generateAttributes(services, uint16(1)) // ble attrs start at 1
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -315,6 +320,9 @@ func (d *device) SetServices(s []*Service) error {
 	}
 	d.mu.Unlock()
 	services := append([]*Service(nil), s...)
+	if err := validateAttributeCount(services); err != nil {
+		return err
+	}
 	attrs := generateAttributes(services, uint16(1)) // ble attrs start at 1
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -326,25 +334,75 @@ func (d *device) SetServices(s []*Service) error {
 }
 
 func (d *device) Advertise(a *AdvPacket) error {
+	return d.advertise(d.hci, a, nil)
+}
+
+// advertisingController is consumed by the complete device configuration flow.
+type advertisingController interface {
+	SendCmdWithAdvOff(cmd.CmdParam) error
+	SetAdvertiseEnable(bool) error
+}
+
+// Constructor options may acquire this gate before the device context exists.
+// They only stage configuration; runtime operations use the initialized context.
+func (d *device) lockAdvertising() error {
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		return io.ErrClosedPipe
+	}
+	if d.advertisingGate == nil {
+		d.advertisingGate = make(chan struct{}, 1)
+	}
+	gate := d.advertisingGate
+	var done <-chan struct{}
+	if d.ctx != nil {
+		done = d.ctx.Done()
+	}
+	d.mu.Unlock()
+	select {
+	case <-done:
+		return io.ErrClosedPipe
+	case gate <- struct{}{}:
+	}
+	d.mu.Lock()
+	stopped := d.stopping || d.ctx != nil && d.ctx.Err() != nil
+	d.mu.Unlock()
+	if stopped {
+		<-gate
+		return io.ErrClosedPipe
+	}
+	return nil
+}
+
+func (d *device) unlockAdvertising() { <-d.advertisingGate }
+
+func (d *device) advertise(controller advertisingController, a *AdvPacket, scan *cmd.LESetScanResponseData) error {
 	if err := a.Err(); err != nil {
 		return err
+	}
+	if err := d.lockAdvertising(); err != nil {
+		return err
+	}
+	defer d.unlockAdvertising()
+	if scan != nil {
+		d.scanResp = scan
 	}
 	d.advData = &cmd.LESetAdvertisingData{
 		AdvertisingDataLength: uint8(a.Len()),
 		AdvertisingData:       a.Bytes(),
 	}
 
-	if err := d.update(); err != nil {
+	if err := d.update(controller); err != nil {
 		return err
 	}
 
-	return d.hci.SetAdvertiseEnable(true)
+	return controller.SetAdvertiseEnable(true)
 }
 
 func (d *device) AdvertiseNameAndServices(name string, uu []UUID) error {
 	a, scan := nameAndServicesPackets(name, uu)
-	d.scanResp = scan
-	return d.Advertise(a)
+	return d.advertise(d.hci, a, scan)
 }
 
 // Keep packet construction independent of controller IO so a replacement can
@@ -369,11 +427,6 @@ func (d *device) AdvertiseIBeaconData(b []byte) error {
 	a := &AdvPacket{}
 	a.AppendFlags(flagGeneralDiscoverable | flagLEOnly)
 	a.AppendManufacturerData(0x004C, b)
-	d.advData = &cmd.LESetAdvertisingData{
-		AdvertisingDataLength: uint8(a.Len()),
-		AdvertisingData:       a.Bytes(),
-	}
-
 	return d.Advertise(a)
 }
 
@@ -389,7 +442,15 @@ func (d *device) AdvertiseIBeacon(u UUID, major, minor uint16, pwr int8) error {
 }
 
 func (d *device) StopAdvertising() error {
-	return d.hci.SetAdvertiseEnable(false)
+	return d.stopAdvertising(d.hci)
+}
+
+func (d *device) stopAdvertising(controller advertisingController) error {
+	if err := d.lockAdvertising(); err != nil {
+		return err
+	}
+	defer d.unlockAdvertising()
+	return controller.SetAdvertiseEnable(false)
 }
 
 func (d *device) Scan(ss []UUID, dup bool) {
@@ -496,22 +557,22 @@ func (d *device) SendHCIRawCommand(c cmd.CmdParam) ([]byte, error) {
 	return d.hci.SendRawCommand(c)
 }
 
-// Flush pending advertising settings to the device.
-func (d *device) update() error {
+// Flush pending advertising settings while the caller owns advertisingGate.
+func (d *device) update(controller advertisingController) error {
 	if d.advParam != nil {
-		if err := d.hci.SendCmdWithAdvOff(d.advParam); err != nil {
+		if err := controller.SendCmdWithAdvOff(d.advParam); err != nil {
 			return err
 		}
 		d.advParam = nil
 	}
 	if d.scanResp != nil {
-		if err := d.hci.SendCmdWithAdvOff(d.scanResp); err != nil {
+		if err := controller.SendCmdWithAdvOff(d.scanResp); err != nil {
 			return err
 		}
 		d.scanResp = nil
 	}
 	if d.advData != nil {
-		if err := d.hci.SendCmdWithAdvOff(d.advData); err != nil {
+		if err := controller.SendCmdWithAdvOff(d.advData); err != nil {
 			return err
 		}
 		d.advData = nil

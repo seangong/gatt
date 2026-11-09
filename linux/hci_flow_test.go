@@ -68,6 +68,7 @@ func TestHCIReceivesCommandsWhileWritingLargeResponse(t *testing.T) {
 	c := newConn(h, handle)
 	h.conns[handle] = c
 	completed := make(chan struct{}, 32)
+	h.registerEventHandlers()
 	h.e.HandleEvent(evt.NumberOfCompletedPkts, evt.HandlerFunc(func(b []byte) error {
 		if err := h.handleNumberOfCompletedPkts(b); err != nil {
 			return err
