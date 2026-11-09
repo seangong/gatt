@@ -103,11 +103,25 @@ func TestAdvertisementUnmarshallSkipsEmptyTxPower(t *testing.T) {
 }
 
 func FuzzAdvertisementUnmarshall(f *testing.F) {
-	for _, seed := range [][]byte{nil, {0, 0}, {2, 2, 0xaa}, {1, typeTxPower}, {0xff, typeCompleteName}, {2, typeCompleteName, 'a'}} {
+	for _, seed := range [][]byte{nil, {0, 0}, {2, 2, 0xaa}, {1, typeTxPower}, {0xff, typeCompleteName}, {2, typeCompleteName, 'a'}, {5, typeAllUUID32, 0x78, 0x56, 0x34, 0x12}, {4, typeServiceData16, 0xaa, 0xfe, 0x42}} {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var a Advertisement
 		_ = a.unmarshall(data)
+		uuids := append([]UUID(nil), a.Services...)
+		uuids = append(uuids, a.SolicitedService...)
+		for _, sd := range a.ServiceData {
+			uuids = append(uuids, sd.UUID)
+		}
+		for _, u := range uuids {
+			if u.Len() != 2 && u.Len() != 16 {
+				t.Fatalf("decoded UUID has unsupported length %d", u.Len())
+			}
+			parsed, err := ParseUUID(u.String())
+			if err != nil || !parsed.Equal(u) {
+				t.Fatalf("decoded UUID cannot round trip: %s, %v", u, err)
+			}
+		}
 	})
 }

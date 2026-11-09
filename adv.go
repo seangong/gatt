@@ -76,6 +76,17 @@ type Advertisement struct {
 	SolicitedService []UUID
 }
 
+// advertisementUUID preserves the public UUID widths by expanding wire-format
+// 32-bit UUIDs to the Bluetooth base UUID. The result owns its bytes.
+func advertisementUUID(b []byte) UUID {
+	if len(b) == 4 {
+		u := []byte{0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0, 0, 0, 0}
+		copy(u[12:], b)
+		return UUID{u}
+	}
+	return UUID{append([]byte(nil), b...)}
+}
+
 // This is only used in Linux port.
 func (a *Advertisement) unmarshall(b []byte) error {
 
@@ -85,7 +96,7 @@ func (a *Advertisement) unmarshall(b []byte) error {
 			return u
 		}
 		for len(d) > 0 {
-			u = append(u, UUID{d[:w]})
+			u = append(u, advertisementUUID(d[:w]))
 			d = d[w:]
 		}
 		return u
@@ -133,9 +144,21 @@ func (a *Advertisement) unmarshall(b []byte) error {
 		case typeManufacturerData:
 			a.ManufacturerData = make([]byte, len(d))
 			copy(a.ManufacturerData, d)
-		// case typeServiceData16,
-		// case typeServiceData32,
-		// case typeServiceData128:
+		case typeServiceData16, typeServiceData32, typeServiceData128:
+			w := 2
+			switch t {
+			case typeServiceData32:
+				w = 4
+			case typeServiceData128:
+				w = 16
+			}
+			if len(d) < w {
+				break
+			}
+			a.ServiceData = append(a.ServiceData, ServiceData{
+				UUID: advertisementUUID(d[:w]),
+				Data: append([]byte(nil), d[w:]...),
+			})
 		default:
 			log.Printf("DATA: [ % X ]", d)
 		}

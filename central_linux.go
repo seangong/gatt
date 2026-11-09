@@ -1,6 +1,7 @@
 package gatt
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -449,6 +450,22 @@ func (c *central) readValue(a attr, capacity, offset int) ([]byte, attEcode) {
 	return rsp.bytes(), attEcodeSuccess
 }
 
+// attTypeEqual compares attribute types as full Bluetooth UUIDs. Attribute
+// values and the public UUID.Equal retain their byte-for-byte comparison.
+func attTypeEqual(u, v UUID) bool {
+	if u.Len() == v.Len() {
+		return u.Equal(v)
+	}
+	if u.Len() == 16 {
+		u, v = v, u
+	}
+	if u.Len() != 2 || v.Len() != 16 {
+		return false
+	}
+	full := [16]byte{0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, u.b[0], u.b[1], 0x00, 0x00}
+	return bytes.Equal(full[:], v.b)
+}
+
 // REQ: ReadByType(0x08), StartHandle, EndHandle, Type(UUID)
 // RSP: ReadByType(0x09), LenOfEachDataField, DataField, DataField, ...
 func (c *central) handleReadByType(b []byte) []byte {
@@ -461,7 +478,7 @@ func (c *central) handleReadByType(b []byte) []byte {
 	w.WriteByteFit(attOpReadByTypeRsp)
 	uuidLen := -1
 	for _, a := range c.attrs.Subrange(start, end) {
-		if !a.typ.Equal(t) {
+		if !attTypeEqual(a.typ, t) {
 			continue
 		}
 		if (a.secure&CharRead) != 0 && c.security > securityLow {
@@ -558,7 +575,7 @@ func (c *central) handleReadByGroup(b []byte) []byte {
 
 	// Only support the ATT ReadByGroupReq for GATT Primary Service Discovery.
 	// More specifically, the "Discover All Primary Services" sub-procedure.
-	if !t.Equal(attrPrimaryServiceUUID) {
+	if !attTypeEqual(t, attrPrimaryServiceUUID) {
 		return attErrorRsp(attOpReadByGroupReq, start, attEcodeUnsuppGrpType)
 	}
 

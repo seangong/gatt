@@ -334,7 +334,19 @@ Linux scanning preserves valid fields when another advertising field is
 malformed. Padding and unparseable tails are removed separately from each
 advertising or scan-response payload before they are combined.
 
+Service UUID lists, solicitation lists and Service Data support 16-, 32- and
+128-bit UUIDs on the wire. Linux expands 32-bit UUIDs to their Bluetooth-base
+128-bit form, so their strings can be parsed by the existing `ParseUUID` API.
+Service Data entries retain their order and duplicates; an empty data payload
+is valid. A field with an incomplete UUID is skipped without discarding other
+valid fields.
+
 ## Linux reads, writes and subscriptions
+
+Linux server Read By Type and Read By Group Type requests match a 16-bit
+attribute type with its equivalent Bluetooth-base 128-bit UUID. Public
+`UUID.Equal` keeps its existing comparison by length and bytes, as does the
+attribute-value comparison in Find By Type Value requests.
 
 Dynamic read handlers receive `ReadRequest.Cap` and `ReadRequest.Offset`. Return
 the requested slice bounded by `Cap`; use `ResponseWriter.SetStatus` for an

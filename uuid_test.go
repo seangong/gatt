@@ -11,6 +11,23 @@ func TestUUID16(t *testing.T) {
 	}
 }
 
+func TestUUIDRepresentationCompatibility(t *testing.T) {
+	short := UUID16(0x180d)
+	long := MustParseUUID("0000180d-0000-1000-8000-00805f9b34fb")
+	if short.Equal(long) || long.Equal(short) {
+		t.Fatal("Equal must retain its representation-sensitive comparison")
+	}
+	for _, u := range []UUID{short, long} {
+		parsed, err := ParseUUID(u.String())
+		if err != nil || !parsed.Equal(u) || parsed.Len() != u.Len() {
+			t.Errorf("ParseUUID(%q) = %v, %v; want the original representation", u.String(), parsed, err)
+		}
+	}
+	if _, err := ParseUUID("0000180d"); err == nil {
+		t.Fatal("ParseUUID must continue rejecting unsupported 32-bit representations")
+	}
+}
+
 func TestReverse(t *testing.T) {
 	cases := []struct {
 		fwd  []byte
