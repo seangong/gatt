@@ -243,7 +243,7 @@ func TestDarwinCallbackPendingKnownUUIDCanBeCanceled(t *testing.T) {
 		return 0, nil
 	})
 	delete(d.plist, old.ID())
-	p := NewPeripheral(UUID{old.id})
+	p := NewPeripheral(MustParseUUID(old.ID()))
 	if p.(*peripheral).d != nil {
 		t.Fatal("known-UUID argument unexpectedly has a device before Connect")
 	}
@@ -269,7 +269,7 @@ func TestDarwinCallbackPendingKnownUUIDCanRetryAfterRemoteDisconnect(t *testing.
 		return 0, nil
 	})
 	delete(d.plist, old.ID())
-	p := NewPeripheral(UUID{old.id})
+	p := NewPeripheral(MustParseUUID(old.ID()))
 	ended := make(chan Peripheral, 2)
 	d.peripheralDisconnected = func(got Peripheral, _ error) { ended <- got }
 	for i := 0; i < 2; i++ {

@@ -164,7 +164,7 @@ func (d *device) Init(f func(Device, State)) error {
 		p := &peripheral{pd: pd, d: d}
 		if d.peripheralDiscovered != nil {
 			pd.Name = a.LocalName
-			d.startCallback(func() { d.peripheralDiscovered(p, a, int(pd.RSSI)) })
+			d.startDiscoveryCallback(func() { d.peripheralDiscovered(p, a, int(pd.RSSI)) })
 		}
 	}
 	if f != nil {
@@ -179,13 +179,34 @@ func (d *device) Init(f func(Device, State)) error {
 	return nil
 }
 
-func (d *device) startCallback(f func()) bool {
+// The HCI scan dispatcher is outside the receiver and shutdown worker set.
+// It may wait for the existing callback allowance without dropping a batch or
+// serializing application callbacks that can wait for one another.
+func (d *device) startDiscoveryCallback(f func()) bool {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.stopping {
+		d.mu.Unlock()
 		return false
 	}
-	return startCallout(d.callbackSlots, f)
+	ctx, slots := d.ctx, d.callbackSlots
+	d.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return false
+	case slots <- struct{}{}:
+	}
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		<-slots
+		return false
+	}
+	d.mu.Unlock()
+	go func() {
+		defer func() { <-slots }()
+		f()
+	}()
+	return true
 }
 
 // runConnection separates cancelable protocol work from ordered application
@@ -453,7 +474,7 @@ func nameAndServicesPackets(name string, uu []UUID) (*AdvPacket, *cmd.LESetScanR
 	a.AppendFlags(flagGeneralDiscoverable | flagLEOnly)
 	a.AppendUUIDFit(uu)
 
-	if len(a.b)+len(name)+2 < MaxEIRPacketLength {
+	if len(a.b)+len(name)+2 <= MaxEIRPacketLength {
 		a.AppendName(name)
 		return a, &cmd.LESetScanResponseData{}
 	}
@@ -496,11 +517,15 @@ func (d *device) stopAdvertising(controller advertisingController) error {
 
 func (d *device) Scan(ss []UUID, dup bool) {
 	// TODO: filter
-	d.hci.SetScanEnable(true, dup)
+	if err := d.hci.SetScanEnable(true, dup); err != nil {
+		log.Printf("gatt: start scanning: %v", err)
+	}
 }
 
 func (d *device) StopScanning() {
-	d.hci.SetScanEnable(false, true)
+	if err := d.hci.SetScanEnable(false, true); err != nil {
+		log.Printf("gatt: stop scanning: %v", err)
+	}
 }
 
 func (d *device) Connect(p Peripheral) {

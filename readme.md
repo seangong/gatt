@@ -249,6 +249,19 @@ macOS `ReadRSSI` returns `-1` on transport or native operation failure, or when
 the response has no integer RSSI value. Successful legacy responses without an
 explicit result field remain supported.
 
+macOS state callbacks run in native receipt order, including the first state
+reported by `Init`. They use a separate FIFO with at most 16 pending states and
+one executing callback. Native responses remain independent, so a state callback
+can call synchronous device APIs or Close. Each callback must return before the
+next state callback runs. Queue exhaustion ends the session through Done/Err.
+Close discards pending states without waiting for the running callback or
+generating an additional PoweredOff event.
+
+For a known macOS peripheral identifier, `NewPeripheral(MustParseUUID(id))`
+preserves its canonical UUID in `ID()` and native connection/cancellation
+commands. Peripheral identifiers are 128-bit UUIDs, distinct from assigned
+16-bit service or characteristic UUIDs.
+
 Repeated macOS `Connect` calls for the same UUID still send the native connection
 command, but preserve the current pending or connected session and its requests,
 cache and subscriptions. Duplicate success events do not publish another session
@@ -374,21 +387,27 @@ with existing lists, and an incomplete list stays incomplete.
 On Linux, automatic advertising recovery follows the last explicit enable or
 stop request. Connections do not enable advertising for a client that has never
 requested it, and a completed stop is not undone by a queued recovery task.
+Recovery also keeps advertising disabled while the current connection count is
+at or above the configured connection threshold. This does not add a limit to
+outgoing connection admission.
 `AdvertiseNameAndServices` clears the previous scan response when its new name
-fits in the advertising packet. Raw `Advertise` and custom scan-response options
-retain their existing behavior.
+fits in the advertising packet, including an exact 31-byte fit. Raw `Advertise`
+and custom scan-response options retain their existing behavior.
 
 Linux serializes complete advertising configurations and explicit advertising
 stops. Built-in advertising options use the same operation gate; option lists
 retain their ordered, partial-application behavior. Device shutdown cancels
 queued operations and interrupts controller IO without waiting for this gate.
 
-`AdvPacket` append methods retain their existing payload-truncation behavior.
-If even a field's two-byte header cannot fit, the packet keeps its previous
-contents and `Err()` reports `ErrEIRPacketTooLong`. `Advertise` returns that
-error before changing advertising state or sending commands. Construct a new
-packet after a build error. When using `Bytes()` with low-level advertising
-options, check `Err()` first; `Bytes()` and `Len()` alone do not report errors.
+`AppendField` retains its raw payload-truncation behavior. `AppendName` shortens
+valid UTF-8 names at whole-character boundaries. `AppendManufacturerData` keeps
+the complete two-byte company identifier and truncates only its variable payload.
+If a field's two-byte header or a manufacturer identifier cannot fit, the packet
+keeps its previous contents and `Err()` reports `ErrEIRPacketTooLong`. Later
+appends preserve the failed packet and its error. `Advertise` returns that error
+before changing advertising state or sending commands. Construct a new packet
+after a build error. When using `Bytes()` with low-level advertising options,
+check `Err()` first; `Bytes()` and `Len()` alone do not report errors.
 
 Linux scanning preserves valid fields when another advertising field is
 malformed. Padding and unparseable tails are removed separately from each
@@ -412,6 +431,30 @@ For scannable advertising, the current Linux discovery callback waits for the
 scan response. Receiving only the advertising report does not produce a
 discovery callback, including when the peer does not answer the scan request.
 This existing callback timing is unchanged.
+
+Linux scan delivery uses a separate queue of complete HCI report batches,
+independent of connection callback slots. It holds up to 16 pending batches and
+one batch being dispatched. A batch may contain more reports than the connection
+limit. Low-level HCI scan handlers keep a separate concurrency allowance of
+`max(1, maxConn)`; portable Device discovery callbacks retain their existing
+shared allowance of `max(1, maxConn) * 16`. Waiting for those allowances happens
+outside the HCI receiver and core shutdown workers. Queued reports are retained
+while callbacks are busy. Batch-queue exhaustion terminates the HCI session with
+an error, observable through HCI Done/Close or device shutdown, instead of
+silently losing reports. Shutdown clears unstarted reports and does not wait
+for running application callbacks.
+
+macOS discovery callbacks use an independent allowance of 16 admitted callbacks
+and a queue of 16 waiting reports. Callbacks remain parallel; waiting reports
+are admitted in receipt order without merging repeated reports. Native responses,
+state callbacks and connection callbacks do not wait for discovery handlers.
+Exhausting the waiting queue ends the device session through Done/Err.
+`StopScanning` clears waiting reports and pauses admission until the next `Scan`;
+`Close` also clears waiting reports and prevents further admission. Already
+admitted callbacks may still run after either call returns. A callback retains
+its allowance until it actually returns, including across stop and restart;
+starting another scan does not reset the allowance. Neither call waits for
+application handlers to finish.
 
 Service UUID lists, solicitation lists and Service Data support 16-, 32- and
 128-bit UUIDs on the wire. Linux expands 32-bit UUIDs to their Bluetooth-base
@@ -520,6 +563,10 @@ layout, it returns an error matching `errors.Is(err, gatt.ErrDatabaseChanged)`
 and closes that connection. Reconnect and rediscover before using attribute
 handles again. Discovery UUID filters remain unimplemented as listed above.
 
+Linux server Read By Type responses check remaining page capacity before
+invoking another matching read handler. A full page returns immediately; readers
+for attributes on a later page are invoked when the client requests that page.
+
 `Service.Characteristics`, `Characteristic.Descriptors` and
 `Characteristic.Descriptor` may be read concurrently with discovery. Published
 collections retain their existing object identities. Returned slices still
@@ -616,6 +663,15 @@ behavior; commands are not automatically retried.
 `Device` interface. Returning from a call is not a connection-success signal;
 observe completion callbacks and use application-level timeouts where needed.
 
+On Linux, `Scan` and `StopScanning` log command failures with the operation
+context. An ordinary controller rejection remains retryable and does not close
+existing connections or generate a new state or error callback. Low-level
+`HCI.SetScanEnable` callers can inspect its returned error programmatically.
+Scan transactions are serialized, and only successful commands update the
+confirmed scanning state. Shutdown conservatively disables a scan whose enable
+outcome is unconfirmed, without waiting for the scan gate or extending the
+existing shutdown deadline. Transport faults retain the existing shutdown path.
+
 On Linux, `Central.ID()` reports the peer's MAC address in its normal displayed
 byte order. Older revisions reversed that address; applications that persisted
 those reversed IDs must correct their mappings. The same central object is
@@ -635,6 +691,9 @@ shutdown retains its callback-suppression behavior. Calls made after shutdown
 starts are not admitted as new connection attempts.
 Low-level HCI callers can use `ConnectWithResult` to receive one buffered result;
 the existing HCI `Connect` return value and success handler remain unchanged.
+An Advertising Timeout (`0x3C`) connection-complete event belongs to directed
+advertising and does not end an outgoing connection attempt or its cancellation
+cleanup. Those operations continue waiting for their own terminal event.
 Successful outgoing connections retain the name known when the attempt began
 if later scan reports have no name. Continuing a scan does not erase that name.
 

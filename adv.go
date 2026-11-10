@@ -3,6 +3,7 @@ package gatt
 import (
 	"errors"
 	"log"
+	"unicode/utf8"
 )
 
 // MaxEIRPacketLength is the maximum allowed AdvertisingPacket
@@ -188,7 +189,7 @@ func (a *AdvPacket) Len() int {
 	return len(a.b)
 }
 
-// Err reports a field whose header could not fit in the packet.
+// Err reports a field whose header or required prefix could not fit in the packet.
 // Truncating field data to fit does not set an error.
 func (a *AdvPacket) Err() error {
 	return a.err
@@ -198,6 +199,9 @@ func (a *AdvPacket) Err() error {
 // Data is truncated to fit. If the field header does not fit, the packet is
 // unchanged and Err reports ErrEIRPacketTooLong.
 func (a *AdvPacket) AppendField(typ byte, b []byte) *AdvPacket {
+	if a.err != nil {
+		return a
+	}
 	// A field consists of len, typ, b.
 	// Len is 1 byte for typ plus len(b).
 	remaining := MaxEIRPacketLength - len(a.b) - 2
@@ -221,16 +225,32 @@ func (a *AdvPacket) AppendFlags(f byte) *AdvPacket {
 
 // AppendFlags appends a name field to the packet.
 // If the name fits in the space, it will be append as a complete name field, otherwise a short name field.
+// Valid UTF-8 names are shortened at character boundaries.
 func (a *AdvPacket) AppendName(n string) *AdvPacket {
 	typ := byte(typeCompleteName)
-	if len(a.b)+2+len(n) > MaxEIRPacketLength {
+	remaining := MaxEIRPacketLength - len(a.b) - 2
+	if len(n) > remaining {
 		typ = byte(typeShortName)
+		if remaining >= 0 && utf8.ValidString(n) {
+			for remaining > 0 && !utf8.RuneStart(n[remaining]) {
+				remaining--
+			}
+			n = n[:remaining]
+		}
 	}
 	return a.AppendField(typ, []byte(n))
 }
 
 // AppendManufacturerData appends a manufacturer data field to the packet.
+// Payload data may be truncated, but the two-byte company identifier must fit.
 func (a *AdvPacket) AppendManufacturerData(id uint16, b []byte) *AdvPacket {
+	if a.err != nil {
+		return a
+	}
+	if MaxEIRPacketLength-len(a.b) < 4 {
+		a.err = ErrEIRPacketTooLong
+		return a
+	}
 	d := append([]byte{uint8(id), uint8(id >> 8)}, b...)
 	return a.AppendField(typeManufacturerData, d)
 }

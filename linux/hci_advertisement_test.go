@@ -11,8 +11,9 @@ import (
 func TestAdvertisementCalloutOwnsItsReport(t *testing.T) {
 	received := make(chan *PlatData, 1)
 	release, returned := make(chan struct{}), make(chan struct{})
+	var returnedOnce sync.Once
 	h := &HCI{connsmu: &sync.Mutex{}, plistmu: &sync.Mutex{}, plist: make(map[peerAddress]*advertisementEntry)}
-	h.AdvertisementHandler = func(pd *PlatData) { received <- pd; <-release; close(returned) }
+	h.AdvertisementHandler = func(pd *PlatData) { received <- pd; <-release; returnedOnce.Do(func() { close(returned) }) }
 	defer func() {
 		close(release)
 		select {

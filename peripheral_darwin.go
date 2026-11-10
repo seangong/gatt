@@ -46,7 +46,13 @@ type peripheral struct {
 	callbacks    *darwinCallbacks
 }
 
-func NewPeripheral(u UUID) Peripheral { return &peripheral{id: xpc.UUID(u.b)} }
+func NewPeripheral(u UUID) Peripheral {
+	id := make(xpc.UUID, len(u.b))
+	for i, b := range u.b {
+		id[len(id)-1-i] = b
+	}
+	return &peripheral{id: id}
+}
 
 func (p *peripheral) Device() Device { return p.d }
 func (p *peripheral) ID() string     { return p.id.String() }

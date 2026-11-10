@@ -57,3 +57,29 @@ func TestNameAndServicesScanResponseBounds(t *testing.T) {
 		t.Fatal("long name did not retain bounded shortened-name behavior")
 	}
 }
+
+func TestNameAndServicesUsesExactAdvertisingCapacity(t *testing.T) {
+	for _, tt := range []struct {
+		services []UUID
+		nameSize int
+	}{
+		{nil, 26},
+		{[]UUID{UUID16(0xff00)}, 22},
+		{[]UUID{MustParseUUID("12345678-1234-5678-1234-567812345678")}, 8},
+	} {
+		name := strings.Repeat("n", tt.nameSize)
+		adv, scan := nameAndServicesPackets(name, tt.services)
+		var parsed Advertisement
+		packet := adv.Bytes()
+		if err := parsed.unmarshall(packet[:adv.Len()]); err != nil {
+			t.Fatal(err)
+		}
+		if adv.Len() != MaxEIRPacketLength || parsed.LocalName != name || scan.ScanResponseDataLength != 0 {
+			t.Fatalf("exact-fit name=%q advertising=%d scan=%d", parsed.LocalName, adv.Len(), scan.ScanResponseDataLength)
+		}
+		_, scan = nameAndServicesPackets(name+"n", tt.services)
+		if scan.ScanResponseDataLength == 0 {
+			t.Fatal("name beyond advertising capacity did not move to scan response")
+		}
+	}
+}

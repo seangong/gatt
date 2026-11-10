@@ -590,6 +590,11 @@ func (c *central) handleReadByType(b []byte) []byte {
 		if !attTypeEqual(a.typ, t) {
 			continue
 		}
+		// Every entry must have the first entry's wire length. Do not invoke
+		// another application reader when its entry cannot fit in this page.
+		if uuidLen != -1 && int(c.mtu)-len(w.b) < 2+min(uuidLen, valueCap) {
+			break
+		}
 		if (a.secure&CharRead) != 0 && c.security > securityLow {
 			if uuidLen != -1 {
 				break

@@ -59,8 +59,12 @@ type HCI struct {
 	closeErr        error
 	workers         sync.WaitGroup
 	callbacks       chan struct{}
-	scanning        bool
+	scanDispatch    *scanDispatcher    // Initialized under connsmu; independent of connection callouts.
+	scanning        bool               // Last successfully confirmed scan state, protected by connsmu.
 	pending         *connectionAttempt // Protected by connsmu.
+
+	scanNeedsDisable bool          // An unconfirmed enable may have reached the controller; protected by connsmu.
+	scanGate         chan struct{} // Serialize complete scan transactions without blocking shutdown.
 
 	adv     bool
 	advmu   *sync.Mutex
@@ -228,6 +232,7 @@ func (h *HCI) initLifecycle() {
 		h.closeDone = make(chan struct{})
 		h.stopping = make(chan struct{})
 		h.advGate = make(chan struct{}, 1)
+		h.scanGate = make(chan struct{}, 1)
 		h.abort = make(chan struct{})
 		h.changed = make(chan struct{}, 1)
 		h.readerDone = make(chan struct{})
@@ -244,6 +249,9 @@ func (h *HCI) requestClose(cause error) <-chan struct{} {
 		close(h.abort)
 	}
 	h.closed = true
+	if h.scanDispatch != nil {
+		h.scanDispatch.stop()
+	}
 	h.c.BeginShutdown()
 	resultErr := h.closeCause
 	if resultErr == nil {
@@ -374,7 +382,7 @@ func (h *HCI) closeTransport() {
 
 func (h *HCI) disconnectAll(ctx context.Context) error {
 	h.connsmu.Lock()
-	scanning, pending := h.scanning, h.pending
+	scanning, pending := h.scanning || h.scanNeedsDisable, h.pending
 	h.connsmu.Unlock()
 	h.advmu.Lock()
 	advertising := h.adv
@@ -515,7 +523,7 @@ func (h *HCI) setAdvertiseEnableLocked(en bool) error {
 	h.advmu.Lock()
 	requested := h.adv
 	h.advmu.Unlock()
-	if en && (!requested || connectionCount == h.maxConn) {
+	if en && (!requested || connectionCount >= h.maxConn) {
 		return nil
 	}
 	if err := h.c.SendAndCheckResp(cmd.LESetAdvertiseEnable{AdvertisingEnable: btoi(en)}, []byte{0}); err != nil {
@@ -556,15 +564,41 @@ func (h *HCI) SendCmdWithAdvOff(cp cmd.CmdParam) error {
 
 func (h *HCI) SetScanEnable(en bool, dup bool) error {
 	h.connsmu.Lock()
+	h.initLifecycle()
+	closed, stopping, gate := h.closed, h.stopping, h.scanGate
+	h.connsmu.Unlock()
+	if closed {
+		return io.ErrClosedPipe
+	}
+	select {
+	case <-stopping:
+		return io.ErrClosedPipe
+	case gate <- struct{}{}:
+	}
+	defer func() { <-gate }()
+
+	h.connsmu.Lock()
 	if h.closed {
 		h.connsmu.Unlock()
 		return io.ErrClosedPipe
 	}
-	h.scanning = en
+	if en {
+		// Shutdown must disable an enable already submitted but not yet
+		// confirmed. Keep this conservative marker on errors whose submission
+		// or controller outcome may be unknown; a successful scan clears it.
+		h.scanNeedsDisable = true
+	}
 	h.connsmu.Unlock()
-	return h.c.SendAndCheckResp(cmd.LESetScanEnable{
+	if err := h.c.SendAndCheckResp(cmd.LESetScanEnable{
 		LEScanEnable: btoi(en), FilterDuplicates: btoi(!dup),
-	}, []byte{0})
+	}, []byte{0}); err != nil {
+		return err
+	}
+	h.connsmu.Lock()
+	h.scanning = en
+	h.scanNeedsDisable = false
+	h.connsmu.Unlock()
+	return nil
 }
 
 func (h *HCI) Connect(pd *PlatData) error {
@@ -955,13 +989,15 @@ func advertisingDataPrefix(data []byte) []byte {
 
 func (h *HCI) handleAdvertisement(b []byte) {
 	// If no one is interested, don't bother.
-	if h.AdvertisementHandler == nil {
+	handler := h.AdvertisementHandler
+	if handler == nil {
 		return
 	}
 	ep := &evt.LEAdvertisingReportEP{}
 	if err := ep.Unmarshal(b); err != nil {
 		return
 	}
+	reports := make([]*PlatData, 0, ep.NumReports)
 	for i := 0; i < int(ep.NumReports); i++ {
 		addr := peerAddress{ep.Address[i], ep.AddressType[i]}
 		et := ep.EventType[i]
@@ -983,7 +1019,7 @@ func (h *HCI) handleAdvertisement(b []byte) {
 			}
 			h.plistmu.Unlock()
 			if found {
-				h.callout(func() { h.AdvertisementHandler(&report) })
+				reports = append(reports, &report)
 			}
 			continue
 		}
@@ -1004,8 +1040,9 @@ func (h *HCI) handleAdvertisement(b []byte) {
 		}
 		report := *pd
 		report.Data = append([]byte(nil), pd.Data...)
-		h.callout(func() { h.AdvertisementHandler(&report) })
+		reports = append(reports, &report)
 	}
+	h.queueScanBatch(scanBatch{handler: handler, reports: reports})
 }
 
 func (h *HCI) handleNumberOfCompletedPkts(b []byte) error {
@@ -1056,6 +1093,11 @@ func (h *HCI) handleConnection(b []byte) {
 	ep := &evt.LEConnectionCompleteEP{}
 	if err := ep.Unmarshal(b); err != nil {
 		h.requestClose(fmt.Errorf("hci: invalid connection-complete event: %w", err))
+		return
+	}
+	// Advertising Timeout ends high-duty-cycle directed advertising, not an
+	// outgoing Create Connection that may be pending at the same time.
+	if ep.Status == 0x3c {
 		return
 	}
 	h.aclSubmit.Lock()

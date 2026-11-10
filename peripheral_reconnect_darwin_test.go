@@ -211,7 +211,7 @@ func testDarwinRepeatedConnectPreservesActiveSession(t *testing.T, kind string) 
 	case "scan-alias":
 		argument = &peripheral{id: live.id, d: d}
 	case "new-peripheral":
-		argument = NewPeripheral(UUID{live.id}).(*peripheral)
+		argument = NewPeripheral(MustParseUUID(live.ID())).(*peripheral)
 	case "retired-alias":
 		argument = &peripheral{id: live.id, d: d}
 		argument.ctx, argument.cancel = context.WithCancelCause(d.ctx)

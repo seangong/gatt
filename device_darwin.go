@@ -43,6 +43,15 @@ type device struct {
 	ready    chan struct{}
 	requests xpcRequests
 	stateMu  sync.Mutex
+	// State callbacks have their own bounded stream, outside native responses.
+	stateReady   <-chan struct{}
+	stateQueue   []darwinStateCallback
+	stateRunning bool
+
+	discoveryMu     sync.Mutex
+	discoveryPaused bool
+	discoveryActive int
+	discoveryQueue  []darwinDiscoveryCallback
 
 	callbackOnce  sync.Once
 	callbackSlots chan struct{}
@@ -96,21 +105,22 @@ func NewDevice(opts ...Option) (Device, error) {
 }
 
 func (d *device) Init(f func(Device, State)) error {
-	d.stateMu.Lock()
-	d.stateChanged = f
-	d.stateMu.Unlock()
-	rsp, err := d.sendReq(1, xpc.Dict{
-		"kCBMsgArgName":    fmt.Sprintf("gopher-%v", time.Now().Unix()),
-		"kCBMsgArgOptions": xpc.Dict{"kCBInitOptionShowPowerAlert": 1},
-		"kCBMsgArgType":    d.role,
+	ready := make(chan struct{})
+	defer close(ready)
+	_, err := d.requests.request(d.ctx, 6, func() error {
+		// Register only after this Init owns the native request slot. Another
+		// Init waiting for it must not replace this call's initial handler.
+		d.stateMu.Lock()
+		d.stateChanged = f
+		d.stateReady = ready
+		d.stateMu.Unlock()
+		return d.sendCBMsg(1, xpc.Dict{
+			"kCBMsgArgName":    fmt.Sprintf("gopher-%v", time.Now().Unix()),
+			"kCBMsgArgOptions": xpc.Dict{"kCBInitOptionShowPowerAlert": 1},
+			"kCBMsgArgType":    d.role,
+		})
 	})
-	if err != nil {
-		return err
-	}
-	if f != nil {
-		go f(d, State(rsp.MustGetInt("kCBMsgArgState")))
-	}
-	return nil
+	return err
 }
 
 func (d *device) Advertise(a *AdvPacket) error {
@@ -415,11 +425,11 @@ func (d *device) Scan(ss []UUID, dup bool) {
 			"kCBScanOptionAllowDuplicates": map[bool]int{true: 1, false: 0}[dup],
 		},
 	}
-	d.sendCmd(29, args)
+	d.sendScanCommand(29, args)
 }
 
 func (d *device) StopScanning() {
-	d.sendCmd(30, nil)
+	d.sendScanCommand(30, nil)
 }
 
 func (d *device) Connect(p Peripheral) {
@@ -758,19 +768,19 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 	//log.Printf(">> %d, %v", id, args)
 
 	switch id {
+	case 6: // StateChanged, including the Init response.
+		// Queue before waking Init so a later state cannot overtake its first
+		// callback. The worker waits for Init to release its response waiter.
+		if !d.queueStateCallback(args) {
+			d.fail(errDarwinStateQueueFull)
+			return
+		}
+		d.requests.deliver(id, args)
 	case // device event
-		6,  // StateChanged
 		16, // AdvertisingStarted
 		17, // AdvertisingStopped
 		18: // ServiceAdded
-		if !d.requests.deliver(id, args) && id == 6 {
-			d.stateMu.Lock()
-			f := d.stateChanged
-			d.stateMu.Unlock()
-			if f != nil {
-				go f(d, State(args.MustGetInt("kCBMsgArgState")))
-			}
-		}
+		d.requests.deliver(id, args)
 
 	case
 		19, // ReadRequest
@@ -813,7 +823,9 @@ func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 			}
 		}
 		if d.peripheralDiscovered != nil {
-			go d.peripheralDiscovered(&peripheral{id: xpc.UUID(u.b), d: d, name: a.LocalName}, a, rssi)
+			if !d.queueDiscoveryCallback(&peripheral{id: xpc.UUID(u.b), d: d, name: a.LocalName}, a, rssi) {
+				d.fail(errDarwinDiscoveryQueueFull)
+			}
 		}
 
 	case peripheralConnected:
@@ -939,6 +951,8 @@ func (d *device) fail(err error) {
 	d.cancel(err)
 	d.attMu.Unlock()
 	err = context.Cause(d.ctx)
+	d.stopStateCallbacks()
+	d.stopDiscoveryCallbacks()
 	// Cancel native delivery even if a user callback is currently blocked.
 	_ = d.conn.Close()
 
