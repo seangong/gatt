@@ -58,6 +58,20 @@ type cmdResult struct {
 	err      error
 }
 
+// Preserve the controller's status for callers that need to distinguish an
+// unsupported command without parsing the error text.
+type commandStatusError struct {
+	opcode uint16
+	status uint8
+}
+
+func (e commandStatusError) Error() string {
+	return fmt.Sprintf("HCI command 0x%04x failed with status 0x%02x", e.opcode, e.status)
+}
+
+func (e commandStatusError) HCIOpcode() uint16 { return e.opcode }
+func (e commandStatusError) HCIStatus() uint8  { return e.status }
+
 func (c cmdPkt) Marshal() []byte {
 	b := make([]byte, 1+2+1+c.cp.Len())
 	b[0] = byte(0x1) // typCommandPkt
@@ -380,7 +394,7 @@ func (c *Cmd) processCmdEvents() {
 			} else {
 				var err error
 				if status.Status != 0 {
-					err = fmt.Errorf("HCI command 0x%04x failed with status 0x%02x", status.CommandOpcode, status.Status)
+					err = commandStatusError{opcode: status.CommandOpcode, status: status.Status}
 				}
 				pending.done <- cmdResult{err: err}
 			}

@@ -1,6 +1,7 @@
 package linux
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -21,24 +22,47 @@ func TestHCIInitializationSelectsControllerCommands(t *testing.T) {
 				h, d := newShutdownTestHCI(t, false)
 				result := make(chan error, 1)
 				go func() { result <- h.resetDevice(context.Background()) }()
-				ops := []uint16{0x0c03, 0x1003, 0x0c01, 0x2001}
+				ops := []uint16{0x0c03, 0x1003}
+				if !leOnly {
+					ops = append(ops, 0x1002)
+				}
+				ops = append(ops, 0x0c01, 0x2001)
 				if !leOnly {
 					ops = append(ops, 0x0c56, 0x0c6d, 0x0c45, 0x0c47, 0x0c43, 0x0c24, 0x0c18, 0x080f, 0x0c33)
 				}
 				ops = append(ops, 0x200b)
+				parameters := map[uint16][]byte{
+					0x0c56: {1},
+					0x0c6d: {1, 0},
+					0x0c45: {2},
+					0x0c47: {1},
+					0x0c43: {1},
+					0x0c24: {0x40, 0x02, 0x04},
+					0x0c18: {0, 0x20},
+					0x080f: {0x05, 0},
+					0x0c33: {0, 0x10, 0xff, 0x14, 0, 0x0a, 0},
+					0x200b: {1, 0x10, 0, 0x10, 0, 0, 0},
+				}
 				for _, op := range ops {
 					packet := shutdownTestCommand(t, d, op)
+					if want, ok := parameters[op]; ok && !bytes.Equal(packet[4:], want) {
+						t.Fatalf("initialization command 0x%04x parameters = %x, want %x", op, packet[4:], want)
+					}
 					rsp := []byte{0}
 					if op == 0x1003 {
 						if len(packet) != 4 || packet[3] != 0 {
 							t.Fatalf("read features command = %x", packet)
 						}
-						rsp = make([]byte, 9)
-						rsp[5] = 0x40 // LE Supported (Controller).
+						features := initializationTestFeatures()
 						if leOnly {
-							rsp[5] |= 0x20 // BR/EDR Not Supported.
-							rsp[8] = 0x80  // Other feature bits do not change the decision.
+							features = [8]byte{0, 0, 0, 0, 0x60, 0, 0, 0x80}
 						}
+						rsp = append([]byte{0}, features[:]...)
+					} else if op == 0x1002 {
+						if len(packet) != 4 || packet[3] != 0 {
+							t.Fatalf("read commands command = %x", packet)
+						}
+						rsp = initializationTestCommands()
 					}
 					d.input <- shutdownTestEvent(evt.CommandComplete, append([]byte{1, byte(op), byte(op >> 8)}, rsp...)...)
 					synctest.Wait()
@@ -80,7 +104,7 @@ func TestHCIInitializationRejectsInvalidFeatures(t *testing.T) {
 }
 
 func TestHCIInitializationKeepsCommandErrorsAndCancellation(t *testing.T) {
-	for _, op := range []uint16{0x0c03, 0x0c56, 0x200b} {
+	for _, op := range []uint16{0x0c03, 0x0c56, 0x0c6d, 0x200b} {
 		synctest.Test(t, func(t *testing.T) {
 			h, d := newShutdownTestHCI(t, false)
 			result := make(chan error, 1)
@@ -90,7 +114,10 @@ func TestHCIInitializationKeepsCommandErrorsAndCancellation(t *testing.T) {
 				got := uint16(packet[1]) | uint16(packet[2])<<8
 				rsp := []byte{0}
 				if got == 0x1003 {
-					rsp = make([]byte, 9)
+					features := initializationTestFeatures()
+					rsp = append([]byte{0}, features[:]...)
+				} else if got == 0x1002 {
+					rsp = initializationTestCommands()
 				}
 				if got == op {
 					rsp[0] = 0x0c

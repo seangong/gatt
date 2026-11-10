@@ -120,9 +120,23 @@ The implementation has a raw-channel fallback for older kernels; that does not
 guarantee compatibility with those systems.
 
 Initialization reads the controller's standard feature report after reset.
-LE-only controllers skip the legacy BR/EDR configuration; dual-mode controllers
-retain it. Required LE command failures still stop initialization. This does
-not add controller-capacity negotiation or pairing support.
+LE-only controllers skip the legacy BR/EDR configuration. Dual-mode controllers
+also query their supported commands and select legacy BR/EDR settings according
+to both command support and feature support. Interlaced scans are enabled only
+when supported; inquiry mode and link policy use the supported subset of their
+previous settings. Controllers supporting the complete configuration retain the
+previous values and relative order of configuration commands.
+
+If the command-support query reports Unknown HCI Command (`0x01`) through a
+Command Status or Command Complete event, initialization logs the compatibility
+fallback and uses the feature report alone. A failed Complete may contain only
+its status or the complete return parameters. Other query errors, malformed
+replies and configuration failures still stop initialization. All queries share
+the existing initialization deadline.
+
+Required LE setup, including dual-mode Write LE Host Supported, remains in
+place when `LnxDeviceID(..., false)` bypasses an incorrectly reported LE feature
+bit. This does not add controller-capacity negotiation or pairing support.
 
 Inspect the adapters and select the one your application will own:
 

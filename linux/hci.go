@@ -914,6 +914,47 @@ func (readLocalSupportedFeatures) Opcode() int    { return 0x1003 }
 func (readLocalSupportedFeatures) Len() int       { return 0 }
 func (readLocalSupportedFeatures) Marshal([]byte) {}
 
+type readLocalSupportedCommands struct{}
+
+func (readLocalSupportedCommands) Opcode() int    { return 0x1002 }
+func (readLocalSupportedCommands) Len() int       { return 0 }
+func (readLocalSupportedCommands) Marshal([]byte) {}
+
+// A nil mask means that an older controller explicitly rejected the query.
+// Other failures cannot safely be treated as missing capability information.
+func (h *HCI) readSupportedCommands(ctx context.Context) ([]byte, error) {
+	rsp, err := h.c.SendContext(ctx, readLocalSupportedCommands{})
+	if cause := ctx.Err(); cause != nil {
+		return nil, fmt.Errorf("read controller commands (0x1002): %w", cause)
+	}
+	if err != nil {
+		var status interface {
+			HCIOpcode() uint16
+			HCIStatus() uint8
+		}
+		if !errors.As(err, &status) || status.HCIOpcode() != 0x1002 || status.HCIStatus() != 0x01 {
+			return nil, fmt.Errorf("read controller commands (0x1002): %w", err)
+		}
+	} else {
+		// An unsuccessful Command Complete may omit its command-specific
+		// return fields or retain their full length.
+		if len(rsp) != 1 && len(rsp) != 65 {
+			return nil, fmt.Errorf("read controller commands (0x1002): response length %d, want 65", len(rsp))
+		}
+		if rsp[0] != 0x01 {
+			if rsp[0] != 0 {
+				return nil, fmt.Errorf("read controller commands (0x1002): invalid response [% X]", rsp)
+			}
+			if len(rsp) != 65 {
+				return nil, fmt.Errorf("read controller commands (0x1002): response length %d, want 65", len(rsp))
+			}
+			return rsp[1:], nil
+		}
+	}
+	log.Printf("hci: Read Local Supported Commands (0x1002) is unavailable; using feature checks for BR/EDR setup")
+	return nil, nil
+}
+
 func (h *HCI) resetDevice(ctx context.Context) error {
 	if err := h.c.SendAndCheckRespContext(ctx, cmd.Reset{}, []byte{0x00}); err != nil {
 		return err
@@ -928,33 +969,72 @@ func (h *HCI) resetDevice(ctx context.Context) error {
 	if len(features) != 9 {
 		return fmt.Errorf("read controller features (0x1003): response length %d, want 9", len(features))
 	}
+	features = features[1:]
 	// Feature bit 37 marks controllers without BR/EDR. Do not require the
 	// LE Supported bit here: LnxDeviceID explicitly allows bypassing that check
 	// for drivers which report it incorrectly.
-	brEdr := features[5]&0x20 == 0
+	brEdr := features[4]&0x20 == 0
 	seq := []cmd.CmdParam{
 		cmd.SetEventMask{EventMask: 0x3dbff807fffbffff},
 		cmd.LESetEventMask{LEEventMask: 0x000000000000001F},
 	}
 	if brEdr {
-		// Preserve the existing dual-mode setup. LE-only controllers exclude
-		// these BR/EDR settings. HostBufferSize is not needed for LE-only setup:
-		// controller-to-host flow control is never enabled by this package.
-		seq = append(seq,
-			cmd.WriteSimplePairingMode{SimplePairingMode: 1},
-			cmd.WriteLEHostSupported{LESupportedHost: 1, SimultaneousLEHost: 0},
-			cmd.WriteInquiryMode{InquiryMode: 2},
-			cmd.WritePageScanType{PageScanType: 1},
-			cmd.WriteInquiryScanType{ScanType: 1},
-			cmd.WriteClassOfDevice{ClassOfDevice: [3]byte{0x40, 0x02, 0x04}},
-			cmd.WritePageTimeout{PageTimeout: 0x2000},
-			cmd.WriteDefaultLinkPolicy{DefaultLinkPolicySettings: 0x5},
-			cmd.HostBufferSize{
+		commands, err := h.readSupportedCommands(ctx)
+		if err != nil {
+			return err
+		}
+		// Command-map offsets exclude Status. In the explicit legacy fallback,
+		// retain prior command availability while still checking parameter features.
+		hasCommand := func(octet int, bit uint) bool {
+			return commands == nil || commands[octet]&(1<<bit) != 0
+		}
+		if hasCommand(17, 6) && features[6]&0x08 != 0 { // Secure Simple Pairing.
+			seq = append(seq, cmd.WriteSimplePairingMode{SimplePairingMode: 1})
+		}
+		// Keep the existing LE host-support attempt even when capability bits are
+		// incomplete; LnxDeviceID permits bypassing an incorrect LE feature bit.
+		seq = append(seq, cmd.WriteLEHostSupported{LESupportedHost: 1, SimultaneousLEHost: 0})
+		if hasCommand(12, 7) {
+			switch {
+			case features[6]&0x01 != 0: // Extended Inquiry Response.
+				seq = append(seq, cmd.WriteInquiryMode{InquiryMode: 2})
+			case features[3]&0x40 != 0: // RSSI with inquiry results.
+				seq = append(seq, cmd.WriteInquiryMode{InquiryMode: 1})
+			}
+		}
+		if hasCommand(13, 1) && features[3]&0x20 != 0 { // Interlaced page scan.
+			seq = append(seq, cmd.WritePageScanType{PageScanType: 1})
+		}
+		if hasCommand(12, 5) && features[3]&0x10 != 0 { // Interlaced inquiry scan.
+			seq = append(seq, cmd.WriteInquiryScanType{ScanType: 1})
+		}
+		if hasCommand(9, 1) {
+			seq = append(seq, cmd.WriteClassOfDevice{ClassOfDevice: [3]byte{0x40, 0x02, 0x04}})
+		}
+		if hasCommand(7, 5) {
+			seq = append(seq, cmd.WritePageTimeout{PageTimeout: 0x2000})
+		}
+		if hasCommand(5, 4) {
+			var policy uint16
+			if features[0]&0x20 != 0 { // Role switch.
+				policy |= 0x01
+			}
+			if features[0]&0x80 != 0 { // Sniff mode.
+				policy |= 0x04
+			}
+			if policy != 0 {
+				seq = append(seq, cmd.WriteDefaultLinkPolicy{DefaultLinkPolicySettings: policy})
+			}
+		}
+		if hasCommand(10, 6) {
+			// Controller-to-host flow control remains disabled. Preserve the
+			// existing buffer declaration only when its command is available.
+			seq = append(seq, cmd.HostBufferSize{
 				HostACLDataPacketLength:            0x1000,
 				HostSynchronousDataPacketLength:    0xff,
 				HostTotalNumACLDataPackets:         0x0014,
-				HostTotalNumSynchronousDataPackets: 0x000a},
-		)
+				HostTotalNumSynchronousDataPackets: 0x000a})
+		}
 	}
 	seq = append(seq,
 		cmd.LESetScanParameters{
